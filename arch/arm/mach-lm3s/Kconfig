@@ -1,0 +1,14 @@
+if ARCH_LM3S
+
+choice
+	prompt "Texas Instruments LM3SXXXX Processor"
+
+config ARCH_LM3S1D21
+	bool "LM3S1D21"
+	select PLAT_STELLARIS
+	help
+	  Include support for the Texas Instruments ARCH_LM3S1D21 MCU.
+
+endchoice
+
+endif

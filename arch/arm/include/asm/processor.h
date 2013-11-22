@@ -57,9 +57,17 @@ struct thread_struct {
 #ifdef CONFIG_MMU
 #define nommu_start_thread(regs) do { } while (0)
 #else
+#ifndef CONFIG_CPU_V7M
 #define nommu_start_thread(regs) regs->ARM_r10 = current->mm->start_data
+#else
+#define nommu_start_thread(regs) do {					\
+	regs->ARM_r10 = current->mm->start_data;			\
+	regs->ARM_EXC_RET = 0xfffffffdL;	/* exception lr */		\
+} while (0)
+#endif
 #endif
 
+#ifndef CONFIG_CPU_V7M
 #define start_thread(regs,pc,sp)					\
 ({									\
 	unsigned long *stack = (unsigned long *)sp;			\
@@ -79,6 +87,27 @@ struct thread_struct {
 	regs->ARM_r0 = stack[0];	/* r0 (argc) */			\
 	nommu_start_thread(regs);					\
 })
+#else
+#define start_thread(regs,pc,sp)					\
+({									\
+	unsigned long *stack = (unsigned long *)sp;			\
+	set_fs(USER_DS);						\
+	memset(regs->uregs, 0, sizeof(regs->uregs));			\
+	if (current->personality & ADDR_LIMIT_32BIT)			\
+		regs->ARM_cpsr = USR_MODE;				\
+	else								\
+		regs->ARM_cpsr = USR26_MODE;				\
+	if (elf_hwcap & HWCAP_THUMB && pc & 1)				\
+		regs->ARM_cpsr |= PSR_T_BIT;				\
+	regs->ARM_cpsr |= PSR_ENDSTATE;					\
+	regs->ARM_pc = pc;		/* pc */			\
+	regs->ARM_sp = sp;		/* sp */			\
+	regs->ARM_r2 = stack[2];	/* r2 (envp) */			\
+	regs->ARM_r1 = stack[1];	/* r1 (argv) */			\
+	regs->ARM_r0 = stack[0];	/* r0 (argc) */			\
+	nommu_start_thread(regs);					\
+})
+#endif
 
 /* Forward declaration, a strange C thing */
 struct task_struct;

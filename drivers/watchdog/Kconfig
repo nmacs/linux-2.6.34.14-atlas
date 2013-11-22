@@ -145,6 +145,14 @@ config KS8695_WATCHDOG
 	  Watchdog timer embedded into KS8695 processor. This will reboot your
 	  system when the timeout is reached.
 
+config STELLARIS_WATCHDOG
+	tristate "Stellaris watchdog"
+	depends on PLAT_STELLARIS
+	select WATCHDOG_NOWAYOUT
+	help
+	  Watchdog timer embedded into Stellaris processor. This will reboot your
+	  system when the timeout is reached.
+
 config S3C2410_WATCHDOG
 	tristate "S3C2410 Watchdog"
 	depends on ARCH_S3C2410

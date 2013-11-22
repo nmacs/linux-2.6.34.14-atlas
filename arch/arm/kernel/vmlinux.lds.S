@@ -7,7 +7,12 @@
 #include <asm/thread_info.h>
 #include <asm/memory.h>
 #include <asm/page.h>
-	
+
+#ifdef CONFIG_PLAT_STELLARIS
+#  include <mach/memorymap.h>
+#  include <mach/irqs.h>
+#endif
+
 OUTPUT_ARCH(arm)
 ENTRY(stext)
 
@@ -54,6 +59,25 @@ SECTIONS
 #endif
 	}
 
+#ifdef CONFIG_COPY_TO_SRAM
+  . = ALIGN(4);
+  .sram_start : {
+    __sram_load_address = .;
+  }
+
+  .sram (STLR_SRAM_BASE + 4*(16 + NR_IRQS)) : AT(__sram_load_address) {
+    __sram_start = .;
+    *(.sram.text)
+    . = ALIGN(4);
+    *(.sram.data)
+    . = ALIGN(4);
+    __sram_end = .;
+  }
+
+  /* Reset the dot pointer or the linker gets confused */
+  . = ADDR(.sram_start) + SIZEOF(.sram);
+#endif
+
 	PERCPU(PAGE_SIZE)
 
 #ifndef CONFIG_XIP_KERNEL
@@ -68,6 +92,10 @@ SECTIONS
 	/DISCARD/ : {
 		*(.ARM.exidx.exit.text)
 		*(.ARM.extab.exit.text)
+#if defined(CONFIG_ARCH_LM3S) || defined(CONFIG_ARCH_TM4C)
+    *(.ARM.exidx.sram.text)
+    *(.ARM.extab.sram.text)
+#endif
 #ifndef CONFIG_HOTPLUG_CPU
 		*(.ARM.exidx.cpuexit.text)
 		*(.ARM.extab.cpuexit.text)
@@ -82,7 +110,13 @@ SECTIONS
 #endif
 	}
 
+#if defined(CONFIG_ARCH_LM3S) || defined(CONFIG_ARCH_TM4C)
+	/* Work around linker bug */
+	__text_loc = .;
+	.text : AT(__text_loc) { /* Real text segment */
+#else
 	.text : {			/* Real text segment		*/
+#endif
 		_text = .;		/* Text and read-only data	*/
 			__exception_text_start = .;
 			*(.exception.text)

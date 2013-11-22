@@ -59,6 +59,11 @@ struct wireless_dev;
 #define SET_ETHTOOL_OPS(netdev,ops) \
 	( (netdev)->ethtool_ops = (ops) )
 
+/* hardware address assignment types */
+#define NET_ADDR_PERM           0       /* address is permanent (default) */
+#define NET_ADDR_RANDOM         1       /* address is generated randomly */
+#define NET_ADDR_STOLEN         2       /* address is stolen from other device */
+
 #define HAVE_ALLOC_NETDEV		/* feature macro: alloc_xxxdev
 					   functions are available. */
 #define HAVE_FREE_NETDEV		/* free_netdev() */
@@ -837,11 +842,11 @@ struct net_device {
 
 	/* Interface address info. */
 	unsigned char		perm_addr[MAX_ADDR_LEN]; /* permanent hw address */
+	unsigned char		addr_assign_type; /* hw address assignment type */
 	unsigned char		addr_len;	/* hardware address length	*/
 	unsigned short          dev_id;		/* for shared network cards */
 
-	struct netdev_hw_addr_list	uc;	/* Secondary unicast
-						   mac addresses */
+	struct netdev_hw_addr_list	uc;	/* Secondary unicast mac addresses */
 	int			uc_promisc;
 	spinlock_t		addr_list_lock;
 	struct dev_addr_list	*mc_list;	/* Multicast mac addresses	*/

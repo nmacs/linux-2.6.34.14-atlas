@@ -514,6 +514,11 @@ static int ecryptfs_symlink(struct inode *dir, struct dentry *dentry,
 	lower_dir_dentry = lock_parent(lower_dentry);
 	mount_crypt_stat = &ecryptfs_superblock_to_private(
 		dir->i_sb)->mount_crypt_stat;
+	if( mount_crypt_stat->flags & ECRYPTFS_NO_SYMLINKS )
+	{
+		rc = -EIO;
+		goto out_lock;
+	}
 	rc = ecryptfs_encrypt_and_encode_filename(&encoded_symname,
 						  &encoded_symlen,
 						  NULL,
@@ -1144,11 +1149,12 @@ const struct inode_operations ecryptfs_symlink_iops = {
 	.put_link = ecryptfs_put_link,
 	.permission = ecryptfs_permission,
 	.setattr = ecryptfs_setattr,
-	.getattr = ecryptfs_getattr_link,
+#ifdef CONFIG_ECRYPT_FS_XATTR
 	.setxattr = ecryptfs_setxattr,
 	.getxattr = ecryptfs_getxattr,
 	.listxattr = ecryptfs_listxattr,
 	.removexattr = ecryptfs_removexattr
+#endif
 };
 
 const struct inode_operations ecryptfs_dir_iops = {
@@ -1162,19 +1168,23 @@ const struct inode_operations ecryptfs_dir_iops = {
 	.mknod = ecryptfs_mknod,
 	.rename = ecryptfs_rename,
 	.permission = ecryptfs_permission,
+#ifdef CONFIG_ECRYPT_FS_XATTR
 	.setattr = ecryptfs_setattr,
 	.setxattr = ecryptfs_setxattr,
 	.getxattr = ecryptfs_getxattr,
 	.listxattr = ecryptfs_listxattr,
 	.removexattr = ecryptfs_removexattr
+#endif
 };
 
 const struct inode_operations ecryptfs_main_iops = {
 	.permission = ecryptfs_permission,
 	.setattr = ecryptfs_setattr,
 	.getattr = ecryptfs_getattr,
+#ifdef CONFIG_ECRYPT_FS_XATTR
 	.setxattr = ecryptfs_setxattr,
 	.getxattr = ecryptfs_getxattr,
 	.listxattr = ecryptfs_listxattr,
 	.removexattr = ecryptfs_removexattr
+#endif
 };

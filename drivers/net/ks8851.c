@@ -9,8 +9,11 @@
  * published by the Free Software Foundation.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #define DEBUG
 
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
@@ -23,6 +26,13 @@
 #include <linux/spi/spi.h>
 
 #include "ks8851.h"
+
+#ifdef CONFIG_PLAT_STELLARIS
+#  include <mach/hardware.h>
+#endif
+#if defined(CONFIG_MACH_ATLAS) || defined(CONFIG_MACH_UWIC)
+#  include <mach/pins.h>
+#endif
 
 /**
  * struct ks8851_rxctrl - KS8851 driver rx control
@@ -76,6 +86,7 @@ union ks8851_tx_hdr {
  * @msg_enable: The message flags controlling driver output (see ethtool).
  * @fid: Incrementing frame id tag.
  * @rc_ier: Cached copy of KS_IER.
+ * @rc_ccr: Cached copy of KS_CCR.
  * @rc_rxqcr: Cached copy of KS_RXQCR.
  *
  * The @lock ensures that the chip is protected when certain operations are
@@ -107,6 +118,8 @@ struct ks8851_net {
 
 	u16			rc_ier;
 	u16			rc_rxqcr;
+	u16			rc_ccr;
+	u16			eeprom_size;
 
 	struct mii_if_info	mii;
 	struct ks8851_rxctrl	rxctrl;
@@ -140,7 +153,7 @@ static int msg_enable;
  *
  * All these calls issue SPI transactions to access the chip's registers. They
  * all require that the necessary lock is held to prevent accesses when the
- * chip is busy transfering packet data (RX/TX FIFO accesses).
+ * chip is busy transferring packet data (RX/TX FIFO accesses).
  */
 
 /**
@@ -341,6 +354,26 @@ static void ks8851_soft_reset(struct ks8851_net *ks, unsigned op)
 }
 
 /**
+ * ks8851_set_powermode - set power mode of the device
+ * @ks: The device state
+ * @pwrmode: The power mode value to write to KS_PMECR.
+ *
+ * Change the power mode of the chip.
+ */
+static void ks8851_set_powermode(struct ks8851_net *ks, unsigned pwrmode)
+{
+	unsigned pmecr;
+
+	netif_dbg(ks, hw, ks->netdev, "setting power mode %d\n", pwrmode);
+
+	pmecr = ks8851_rdreg16(ks, KS_PMECR);
+	pmecr &= ~PMECR_PM_MASK;
+	pmecr |= pwrmode;
+
+	ks8851_wrreg16(ks, KS_PMECR, pmecr);
+}
+
+/**
  * ks8851_write_mac_addr - write mac address to device registers
  * @dev: The network device
  *
@@ -356,12 +389,38 @@ static int ks8851_write_mac_addr(struct net_device *dev)
 
 	mutex_lock(&ks->lock);
 
+	/*
+	 * Wake up chip in case it was powered off when stopped; otherwise,
+	 * the first write to the MAC address does not take effect.
+	 */
+	ks8851_set_powermode(ks, PMECR_PM_NORMAL);
 	for (i = 0; i < ETH_ALEN; i++)
 		ks8851_wrreg8(ks, KS_MAR(i), dev->dev_addr[i]);
+	if (!netif_running(dev))
+		ks8851_set_powermode(ks, PMECR_PM_SOFTDOWN);
 
 	mutex_unlock(&ks->lock);
 
 	return 0;
+}
+
+/**
+ * ks8851_read_mac_addr - read mac address from device registers
+ * @dev: The network device
+ *
+ * Update our copy of the KS8851 MAC address from the registers of @dev.
+*/
+static void ks8851_read_mac_addr(struct net_device *dev)
+{
+	struct ks8851_net *ks = netdev_priv(dev);
+	int i;
+
+	mutex_lock(&ks->lock);
+
+	for (i = 0; i < ETH_ALEN; i++)
+		dev->dev_addr[i] = ks8851_rdreg8(ks, KS_MAR(i));
+
+	mutex_unlock(&ks->lock);
 }
 
 /**
@@ -380,13 +439,18 @@ static void ks8851_init_mac(struct ks8851_net *ks)
 {
 	struct net_device *dev = ks->netdev;
 
-	random_ether_addr(dev->dev_addr);
+	//random_ether_addr(dev->dev_addr);
+	eth_hw_addr_random(dev);
 	ks8851_write_mac_addr(dev);
 }
 
+#ifdef CONFIG_PLAT_STELLARIS
+extern void gpioclearint(uint32_t pinset);
+#endif
+
 /**
  * ks8851_irq - device interrupt handler
- * @irq: Interrupt number passed from the IRQ hnalder.
+ * @irq: Interrupt number passed from the IRQ handler.
  * @pw: The private word passed to register_irq(), our struct ks8851_net.
  *
  * Disable the interrupt from happening again until we've processed the
@@ -395,6 +459,10 @@ static void ks8851_init_mac(struct ks8851_net *ks)
 static irqreturn_t ks8851_irq(int irq, void *pw)
 {
 	struct ks8851_net *ks = pw;
+
+#ifdef CONFIG_PLAT_STELLARIS
+  gpioclearint(GPIO_ETH_INTRN);
+#endif
 
 	disable_irq_nosync(irq);
 	schedule_work(&ks->irq_work);
@@ -417,8 +485,8 @@ static void ks8851_rdfifo(struct ks8851_net *ks, u8 *buff, unsigned len)
 	u8 txb[1];
 	int ret;
 
-	if (netif_msg_rx_status(ks))
-		ks_dbg(ks, "%s: %d@%p\n", __func__, len, buff);
+	netif_dbg(ks, rx_status, ks->netdev,
+		  "%s: %d@%p\n", __func__, len, buff);
 
 	/* set the operation we're issuing */
 	txb[0] = KS_SPIOP_RXFIFO;
@@ -446,7 +514,8 @@ static void ks8851_rdfifo(struct ks8851_net *ks, u8 *buff, unsigned len)
 */
 static void ks8851_dbg_dumpkkt(struct ks8851_net *ks, u8 *rxpkt)
 {
-	ks_dbg(ks, "pkt %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+	netdev_dbg(ks->netdev,
+		   "pkt %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
 	       rxpkt[4], rxpkt[5], rxpkt[6], rxpkt[7],
 	       rxpkt[8], rxpkt[9], rxpkt[10], rxpkt[11],
 	       rxpkt[12], rxpkt[13], rxpkt[14], rxpkt[15]);
@@ -471,8 +540,8 @@ static void ks8851_rx_pkts(struct ks8851_net *ks)
 
 	rxfc = ks8851_rdreg8(ks, KS_RXFC);
 
-	if (netif_msg_rx_status(ks))
-		ks_dbg(ks, "%s: %d packets\n", __func__, rxfc);
+	netif_dbg(ks, rx_status, ks->netdev,
+		  "%s: %d packets\n", __func__, rxfc);
 
 	/* Currently we're issuing a read per packet, but we could possibly
 	 * improve the code by issuing a single read, getting the receive
@@ -481,17 +550,16 @@ static void ks8851_rx_pkts(struct ks8851_net *ks)
 	 *
 	 * This form of operation would require us to hold the SPI bus'
 	 * chipselect low during the entie transaction to avoid any
-	 * reset to the data stream comming from the chip.
+	 * reset to the data stream coming from the chip.
 	 */
 
 	for (; rxfc != 0; rxfc--) {
 		rxh = ks8851_rdreg32(ks, KS_RXFHSR);
 		rxstat = rxh & 0xffff;
-		rxlen = rxh >> 16;
+		rxlen = (rxh >> 16) & 0xFFF;
 
-		if (netif_msg_rx_status(ks))
-			ks_dbg(ks, "rx: stat 0x%04x, len 0x%04x\n",
-				rxstat, rxlen);
+		netif_dbg(ks, rx_status, ks->netdev,
+			  "rx: stat 0x%04x, len 0x%04x\n", rxstat, rxlen);
 
 		/* the length of the packet includes the 32bit CRC */
 
@@ -502,30 +570,33 @@ static void ks8851_rx_pkts(struct ks8851_net *ks)
 		ks8851_wrreg16(ks, KS_RXQCR,
 			       ks->rc_rxqcr | RXQCR_SDA | RXQCR_ADRFE);
 
-		if (rxlen > 0) {
-			skb = netdev_alloc_skb(ks->netdev, rxlen + 2 + 8);
-			if (!skb) {
-				/* todo - dump frame and move on */
-			}
+		if (rxlen > 4) {
+			unsigned int rxalign;
 
-			/* two bytes to ensure ip is aligned, and four bytes
-			 * for the status header and 4 bytes of garbage */
-			skb_reserve(skb, 2 + 4 + 4);
+			rxlen -= 4;
+			rxalign = ALIGN(rxlen, 4);
+			skb = netdev_alloc_skb_ip_align(ks->netdev, rxalign);
+			if (skb) {
 
-			rxpkt = skb_put(skb, rxlen - 4) - 8;
+				/* 4 bytes of status header + 4 bytes of
+				 * garbage: we put them before ethernet
+				 * header, so that they are copied,
+				 * but ignored.
+				 */
 
-			/* align the packet length to 4 bytes, and add 4 bytes
-			 * as we're getting the rx status header as well */
-			ks8851_rdfifo(ks, rxpkt, ALIGN(rxlen, 4) + 8);
+				rxpkt = skb_put(skb, rxlen) - 8;
+
+				ks8851_rdfifo(ks, rxpkt, rxalign + 8);
 
 			if (netif_msg_pktdata(ks))
 				ks8851_dbg_dumpkkt(ks, rxpkt);
 
 			skb->protocol = eth_type_trans(skb, ks->netdev);
-			netif_rx(skb);
+				netif_rx_ni(skb);
 
 			ks->netdev->stats.rx_packets++;
-			ks->netdev->stats.rx_bytes += rxlen - 4;
+				ks->netdev->stats.rx_bytes += rxlen;
+			}
 		}
 
 		ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr);
@@ -553,14 +624,11 @@ static void ks8851_irq_work(struct work_struct *work)
 
 	status = ks8851_rdreg16(ks, KS_ISR);
 
-	if (netif_msg_intr(ks))
-		dev_dbg(&ks->spidev->dev, "%s: status 0x%04x\n",
-			__func__, status);
+	netif_dbg(ks, intr, ks->netdev,
+		  "%s: status 0x%04x\n", __func__, status);
 
-	if (status & IRQ_LCI) {
-		/* should do something about checking link status */
+	if (status & IRQ_LCI)
 		handled |= IRQ_LCI;
-	}
 
 	if (status & IRQ_LDI) {
 		u16 pmecr = ks8851_rdreg16(ks, KS_PMECR);
@@ -582,8 +650,8 @@ static void ks8851_irq_work(struct work_struct *work)
 		 * system */
 		ks->tx_space = ks8851_rdreg16(ks, KS_TXMIR);
 
-		if (netif_msg_intr(ks))
-			ks_dbg(ks, "%s: txspace %d\n", __func__, ks->tx_space);
+		netif_dbg(ks, intr, ks->netdev,
+			  "%s: txspace %d\n", __func__, ks->tx_space);
 	}
 
 	if (status & IRQ_RXI)
@@ -623,6 +691,9 @@ static void ks8851_irq_work(struct work_struct *work)
 
 	mutex_unlock(&ks->lock);
 
+	if (status & IRQ_LCI)
+		mii_check_link(&ks->mii);
+
 	if (status & IRQ_TXI)
 		netif_wake_queue(ks->netdev);
 
@@ -631,7 +702,7 @@ static void ks8851_irq_work(struct work_struct *work)
 
 /**
  * calc_txlen - calculate size of message to send packet
- * @len: Lenght of data
+ * @len: Length of data
  *
  * Returns the size of the TXFIFO message needed to send
  * this packet.
@@ -659,8 +730,7 @@ static void ks8851_wrpkt(struct ks8851_net *ks, struct sk_buff *txp, bool irq)
 	unsigned fid = 0;
 	int ret;
 
-	if (netif_msg_tx_queued(ks))
-		dev_dbg(&ks->spidev->dev, "%s: skb %p, %d@%p, irq %d\n",
+	netif_dbg(ks, tx_queued, ks->netdev, "%s: skb %p, %d@%p, irq %d\n",
 			__func__, txp, txp->len, txp->data, irq);
 
 	fid = ks->fid++;
@@ -723,37 +793,16 @@ static void ks8851_tx_work(struct work_struct *work)
 		last = skb_queue_empty(&ks->txq);
 
 		if (txb != NULL) {
-			ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr | RXQCR_SDA);
-			ks8851_wrpkt(ks, txb, last);
-			ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr);
-			ks8851_wrreg16(ks, KS_TXQCR, TXQCR_METFE);
+		ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr | RXQCR_SDA);
+		ks8851_wrpkt(ks, txb, last);
+		ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr);
+		ks8851_wrreg16(ks, KS_TXQCR, TXQCR_METFE);
 
-			ks8851_done_tx(ks, txb);
-		}
+		ks8851_done_tx(ks, txb);
+	}
 	}
 
 	mutex_unlock(&ks->lock);
-}
-
-/**
- * ks8851_set_powermode - set power mode of the device
- * @ks: The device state
- * @pwrmode: The power mode value to write to KS_PMECR.
- *
- * Change the power mode of the chip.
- */
-static void ks8851_set_powermode(struct ks8851_net *ks, unsigned pwrmode)
-{
-	unsigned pmecr;
-
-	if (netif_msg_hw(ks))
-		ks_dbg(ks, "setting power mode %d\n", pwrmode);
-
-	pmecr = ks8851_rdreg16(ks, KS_PMECR);
-	pmecr &= ~PMECR_PM_MASK;
-	pmecr |= pwrmode;
-
-	ks8851_wrreg16(ks, KS_PMECR, pmecr);
 }
 
 /**
@@ -771,8 +820,7 @@ static int ks8851_net_open(struct net_device *dev)
 	 * else at the moment */
 	mutex_lock(&ks->lock);
 
-	if (netif_msg_ifup(ks))
-		ks_dbg(ks, "opening %s\n", dev->name);
+	netif_dbg(ks, ifup, ks->netdev, "opening\n");
 
 	/* bring chip out of any power saving mode it was in */
 	ks8851_set_powermode(ks, PMECR_PM_NORMAL);
@@ -828,8 +876,7 @@ static int ks8851_net_open(struct net_device *dev)
 
 	netif_start_queue(ks->netdev);
 
-	if (netif_msg_ifup(ks))
-		ks_dbg(ks, "network device %s up\n", dev->name);
+	netif_dbg(ks, ifup, ks->netdev, "network device up\n");
 
 	mutex_unlock(&ks->lock);
 	return 0;
@@ -847,22 +894,22 @@ static int ks8851_net_stop(struct net_device *dev)
 {
 	struct ks8851_net *ks = netdev_priv(dev);
 
-	if (netif_msg_ifdown(ks))
-		ks_info(ks, "%s: shutting down\n", dev->name);
+	netif_info(ks, ifdown, dev, "shutting down\n");
 
 	netif_stop_queue(dev);
 
 	mutex_lock(&ks->lock);
+	/* turn off the IRQs and ack any outstanding */
+	ks8851_wrreg16(ks, KS_IER, 0x0000);
+	ks8851_wrreg16(ks, KS_ISR, 0xffff);
+	mutex_unlock(&ks->lock);
 
 	/* stop any outstanding work */
 	flush_work(&ks->irq_work);
 	flush_work(&ks->tx_work);
 	flush_work(&ks->rxctrl_work);
 
-	/* turn off the IRQs and ack any outstanding */
-	ks8851_wrreg16(ks, KS_IER, 0x0000);
-	ks8851_wrreg16(ks, KS_ISR, 0xffff);
-
+	mutex_lock(&ks->lock);
 	/* shutdown RX process */
 	ks8851_wrreg16(ks, KS_RXCR1, 0x0000);
 
@@ -871,18 +918,18 @@ static int ks8851_net_stop(struct net_device *dev)
 
 	/* set powermode to soft power down to save power */
 	ks8851_set_powermode(ks, PMECR_PM_SOFTDOWN);
+	mutex_unlock(&ks->lock);
 
 	/* ensure any queued tx buffers are dumped */
 	while (!skb_queue_empty(&ks->txq)) {
 		struct sk_buff *txb = skb_dequeue(&ks->txq);
 
-		if (netif_msg_ifdown(ks))
-			ks_dbg(ks, "%s: freeing txb %p\n", __func__, txb);
+		netif_dbg(ks, ifdown, ks->netdev,
+			  "%s: freeing txb %p\n", __func__, txb);
 
 		dev_kfree_skb(txb);
 	}
 
-	mutex_unlock(&ks->lock);
 	return 0;
 }
 
@@ -906,9 +953,8 @@ static netdev_tx_t ks8851_start_xmit(struct sk_buff *skb,
 	unsigned needed = calc_txlen(skb->len);
 	netdev_tx_t ret = NETDEV_TX_OK;
 
-	if (netif_msg_tx_queued(ks))
-		ks_dbg(ks, "%s: skb %p, %d@%p\n", __func__,
-		       skb, skb->len, skb->data);
+	netif_dbg(ks, tx_queued, ks->netdev,
+		  "%s: skb %p, %d@%p\n", __func__, skb, skb->len, skb->data);
 
 	spin_lock(&ks->statelock);
 
@@ -967,17 +1013,19 @@ static void ks8851_set_rx_mode(struct net_device *dev)
 
 		rxctrl.rxcr1 = (RXCR1_RXME | RXCR1_RXAE |
 				RXCR1_RXPAFMA | RXCR1_RXMAFMA);
-	} else if (dev->flags & IFF_MULTICAST && !netdev_mc_empty(dev)) {
-		struct dev_mc_list *mcptr;
+	} else if (dev->flags & IFF_MULTICAST && dev->mc_count > 0) {
+		struct dev_mc_list *mcptr = dev->mc_list;
 		u32 crc;
+		int i;
 
 		/* accept some multicast */
 
-		netdev_for_each_mc_addr(mcptr, dev) {
+		for (i = dev->mc_count; i > 0; i--) {
 			crc = ether_crc(ETH_ALEN, mcptr->dmi_addr);
 			crc >>= (32 - 6);  /* get top six bits */
 
 			rxctrl.mchash[crc >> 4] |= (1 << (crc & 0xf));
+			mcptr = mcptr->next;
 		}
 
 		rxctrl.rxcr1 = RXCR1_RXME | RXCR1_RXPAFMA;
@@ -1015,6 +1063,7 @@ static int ks8851_set_mac_address(struct net_device *dev, void *addr)
 	if (!is_valid_ether_addr(sa->sa_data))
 		return -EADDRNOTAVAIL;
 
+	dev->addr_assign_type &= ~NET_ADDR_RANDOM;
 	memcpy(dev->dev_addr, sa->sa_data, ETH_ALEN);
 	return ks8851_write_mac_addr(dev);
 }
@@ -1133,7 +1182,7 @@ static int ks8851_phy_reg(int reg)
  * @reg: The register to read.
  *
  * This call reads data from the PHY register specified in @reg. Since the
- * device does not support all the MII registers, the non-existant values
+ * device does not support all the MII registers, the non-existent values
  * are always returned as zero.
  *
  * We return zero for unsupported registers as the MII code does not check
@@ -1187,17 +1236,17 @@ static int ks8851_read_selftest(struct ks8851_net *ks)
 	rd = ks8851_rdreg16(ks, KS_MBIR);
 
 	if ((rd & both_done) != both_done) {
-		ks_warn(ks, "Memory selftest not finished\n");
+		netdev_warn(ks->netdev, "Memory selftest not finished\n");
 		return 0;
 	}
 
 	if (rd & MBIR_TXMBFA) {
-		ks_err(ks, "TX memory selftest fail\n");
+		netdev_err(ks->netdev, "TX memory selftest fail\n");
 		ret |= 1;
 	}
 
 	if (rd & MBIR_RXMBFA) {
-		ks_err(ks, "RX memory selftest fail\n");
+		netdev_err(ks->netdev, "RX memory selftest fail\n");
 		ret |= 2;
 	}
 
@@ -1206,17 +1255,47 @@ static int ks8851_read_selftest(struct ks8851_net *ks)
 
 /* driver bus management functions */
 
+#ifdef CONFIG_PM
+static int ks8851_suspend(struct spi_device *spi, pm_message_t state)
+{
+	struct ks8851_net *ks = dev_get_drvdata(&spi->dev);
+	struct net_device *dev = ks->netdev;
+
+	if (netif_running(dev)) {
+		netif_device_detach(dev);
+		ks8851_net_stop(dev);
+	}
+
+	return 0;
+}
+
+static int ks8851_resume(struct spi_device *spi)
+{
+	struct ks8851_net *ks = dev_get_drvdata(&spi->dev);
+	struct net_device *dev = ks->netdev;
+
+	if (netif_running(dev)) {
+		ks8851_net_open(dev);
+		netif_device_attach(dev);
+	}
+
+	return 0;
+}
+#else
+#define ks8851_suspend NULL
+#define ks8851_resume NULL
+#endif
+
 static int __devinit ks8851_probe(struct spi_device *spi)
 {
 	struct net_device *ndev;
 	struct ks8851_net *ks;
 	int ret;
+	unsigned cider;
 
 	ndev = alloc_etherdev(sizeof(struct ks8851_net));
-	if (!ndev) {
-		dev_err(&spi->dev, "failed to alloc ethernet device\n");
+	if (!ndev)
 		return -ENOMEM;
-	}
 
 	spi->bits_per_word = 8;
 
@@ -1272,12 +1351,22 @@ static int __devinit ks8851_probe(struct spi_device *spi)
 	ks8851_soft_reset(ks, GRR_GSR);
 
 	/* simple check for a valid chip being connected to the bus */
-
-	if ((ks8851_rdreg16(ks, KS_CIDER) & ~CIDER_REV_MASK) != CIDER_ID) {
+	cider = ks8851_rdreg16(ks, KS_CIDER);
+	if ((cider & ~CIDER_REV_MASK) != CIDER_ID) {
 		dev_err(&spi->dev, "failed to read device ID\n");
+#ifndef CONFIG_KS8851_IGNORE_WRONG_CIDER
 		ret = -ENODEV;
 		goto err_id;
+#endif
 	}
+
+	/* cache the contents of the CCR register for EEPROM, etc. */
+	ks->rc_ccr = ks8851_rdreg16(ks, KS_CCR);
+
+	if (ks->rc_ccr & CCR_EEPROM)
+		ks->eeprom_size = 128;
+	else
+		ks->eeprom_size = 0;
 
 	ks8851_read_selftest(ks);
 	ks8851_init_mac(ks);
@@ -1295,15 +1384,15 @@ static int __devinit ks8851_probe(struct spi_device *spi)
 		goto err_netdev;
 	}
 
-	dev_info(&spi->dev, "revision %d, MAC %pM, IRQ %d\n",
-		 CIDER_REV_GET(ks8851_rdreg16(ks, KS_CIDER)),
-		 ndev->dev_addr, ndev->irq);
+	netdev_info(ndev, "revision %d, MAC %pM, IRQ %d, %s EEPROM\n",
+		    CIDER_REV_GET(cider), ndev->dev_addr, ndev->irq,
+		    ks->rc_ccr & CCR_EEPROM ? "has" : "no");
 
 	return 0;
 
 
 err_netdev:
-	free_irq(ndev->irq, ndev);
+	free_irq(ndev->irq, ks);
 
 err_id:
 err_irq:
@@ -1316,7 +1405,7 @@ static int __devexit ks8851_remove(struct spi_device *spi)
 	struct ks8851_net *priv = dev_get_drvdata(&spi->dev);
 
 	if (netif_msg_drv(priv))
-		dev_info(&spi->dev, "remove");
+		dev_info(&spi->dev, "remove\n");
 
 	unregister_netdev(priv->netdev);
 	free_irq(spi->irq, priv);
@@ -1332,6 +1421,8 @@ static struct spi_driver ks8851_driver = {
 	},
 	.probe = ks8851_probe,
 	.remove = __devexit_p(ks8851_remove),
+	.suspend = ks8851_suspend,
+	.resume = ks8851_resume,
 };
 
 static int __init ks8851_init(void)

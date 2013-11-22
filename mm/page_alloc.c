@@ -1871,6 +1871,10 @@ rebalance:
 	if (page)
 		goto got_pg;
 
+#ifndef CONFIG_MMU
+	drop_pagecache();
+#endif
+
 	/* Allocate without watermarks if the context allows */
 	if (alloc_flags & ALLOC_NO_WATERMARKS) {
 		page = __alloc_pages_high_priority(gfp_mask, order,

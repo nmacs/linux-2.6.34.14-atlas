@@ -51,6 +51,10 @@ asmlinkage int sys_clone(unsigned long clone_flags, unsigned long newsp,
 	if (!newsp)
 		newsp = regs->ARM_sp;
 
+#ifdef CONFIG_CPU_V7M
+	newsp -= 32;
+#endif
+
 	return do_fork(clone_flags, newsp, regs, 0, parent_tidptr, child_tidptr);
 }
 

@@ -18,6 +18,7 @@
 #endif
 
 #include <asm/ptrace.h>
+#include <asm/domain.h>
 
 /*
  * Endian independent macros for shifting bytes within registers.
@@ -129,7 +130,11 @@
  * assumes FIQs are enabled, and that the processor is in SVC mode.
  */
 	.macro	save_and_disable_irqs, oldcpsr
+#ifdef CONFIG_CPU_V7M
+	mrs	\oldcpsr, primask
+#else
 	mrs	\oldcpsr, cpsr
+#endif
 	disable_irq
 	.endm
 
@@ -138,7 +143,11 @@
  * guarantee that this will preserve the flags.
  */
 	.macro	restore_irqs_notrace, oldcpsr
+#ifdef CONFIG_CPU_V7M
+	msr	primask, \oldcpsr
+#else
 	msr	cpsr_c, \oldcpsr
+#endif
 	.endm
 
 	.macro restore_irqs, oldcpsr
@@ -167,7 +176,10 @@
 #endif
 	.endm
 
-#ifdef CONFIG_THUMB2_KERNEL
+#if defined(CONFIG_CPU_V7M)
+	.macro	setmode, mode, reg
+	.endm
+#elif defined(CONFIG_THUMB2_KERNEL)
 	.macro	setmode, mode, reg
 	mov	\reg, #\mode
 	msr	cpsr_c, \reg
@@ -183,12 +195,12 @@
  */
 #ifdef CONFIG_THUMB2_KERNEL
 
-	.macro	usraccoff, instr, reg, ptr, inc, off, cond, abort
+	.macro	usraccoff, instr, reg, ptr, inc, off, cond, abort, t=T()
 9999:
 	.if	\inc == 1
-	\instr\cond\()bt \reg, [\ptr, #\off]
+	\instr\cond\()b\()\t\().w \reg, [\ptr, #\off]
 	.elseif	\inc == 4
-	\instr\cond\()t \reg, [\ptr, #\off]
+	\instr\cond\()\t\().w \reg, [\ptr, #\off]
 	.else
 	.error	"Unsupported inc macro argument"
 	.endif
@@ -215,7 +227,7 @@
 	@ Slightly optimised to avoid incrementing the pointer twice
 	usraccoff \instr, \reg, \ptr, \inc, 0, \cond, \abort
 	.if	\rept == 2
-	usraccoff \instr, \reg, \ptr, \inc, \inc, \cond, \abort
+	usraccoff \instr, \reg, \ptr, \inc, 4, \cond, \abort
 	.endif
 
 	add\cond \ptr, #\rept * \inc
@@ -223,13 +235,13 @@
 
 #else	/* !CONFIG_THUMB2_KERNEL */
 
-	.macro	usracc, instr, reg, ptr, inc, cond, rept, abort
+	.macro	usracc, instr, reg, ptr, inc, cond, rept, abort, t=T()
 	.rept	\rept
 9999:
 	.if	\inc == 1
-	\instr\cond\()bt \reg, [\ptr], #\inc
+	\instr\cond\()b\()\t \reg, [\ptr], #\inc
 	.elseif	\inc == 4
-	\instr\cond\()t \reg, [\ptr], #\inc
+	\instr\cond\()\t \reg, [\ptr], #\inc
 	.else
 	.error	"Unsupported inc macro argument"
 	.endif

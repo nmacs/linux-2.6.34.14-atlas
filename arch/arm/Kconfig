@@ -226,6 +226,16 @@ choice
 	prompt "ARM system type"
 	default ARCH_VERSATILE
 
+config ARCH_LM3S
+	bool "Texas Instruments LM3SXXXX"
+	help
+	  This enables support for systems based on the LM3S1D21 MCUs
+
+config ARCH_TM4C
+	bool "Texas Instruments TM4CXXXX"
+	help
+	  This enables support for systems based on the TM4CXXXX MCUs
+
 config ARCH_AAEC2000
 	bool "Agilent AAEC-2000 based"
 	select CPU_ARM920T
@@ -804,6 +814,25 @@ config ARCH_OMAP
 
 endchoice
 
+choice
+	prompt "System type"
+	default ARCH_UWIC_1_0
+
+config ARCH_UWIC_1_0
+	bool "uWIC 1.0"
+	depends on ARCH_LM3S1D21
+	help
+	  Support of uWIC 1.0.
+
+config ARCH_ATLAS
+	bool "ATLAS board support"
+	depends on ARCH_TM4C12
+	select MACH_ATLAS
+	help
+	  Support of ATLAS board.
+
+endchoice
+
 #
 # This is sorted alphabetically by mach-* pathname.  However, plat-*
 # Kconfigs may be included either alphabetically (according to the
@@ -921,6 +950,21 @@ source "arch/arm/mach-ux500/Kconfig"
 source "arch/arm/mach-versatile/Kconfig"
 
 source "arch/arm/mach-w90x900/Kconfig"
+if ARCH_LM3S
+source "arch/arm/mach-lm3s/Kconfig"
+endif
+
+if ARCH_TM4C
+source "arch/arm/mach-tm4c/Kconfig"
+endif
+
+if ARCH_LM3S || ARCH_TM4C
+source "arch/arm/plat-stellaris/Kconfig"
+endif
+
+if ARCH_ATLAS
+source "arch/arm/mach-atlas/Kconfig"
+endif
 
 # Definitions to make life easier
 config ARCH_ACORN
@@ -1198,7 +1242,7 @@ config HZ
 
 config THUMB2_KERNEL
 	bool "Compile the kernel in Thumb-2 mode"
-	depends on CPU_V7 && EXPERIMENTAL
+	depends on (CPU_V7 || CPU_V7M) && EXPERIMENTAL
 	select AEABI
 	select ARM_ASM_UNIFIED
 	help
@@ -1228,7 +1272,7 @@ config AEABI
 
 config OABI_COMPAT
 	bool "Allow old ABI binaries to run with this kernel (EXPERIMENTAL)"
-	depends on AEABI && EXPERIMENTAL
+	depends on AEABI && !CPU_V7M && EXPERIMENTAL
 	default y
 	help
 	  This option preserves the old syscall interface along with the

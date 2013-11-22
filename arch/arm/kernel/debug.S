@@ -163,6 +163,8 @@ ENDPROC(printhex2)
 
 		.ltorg
 
+#ifndef CONFIG_PLAT_STELLARIS
+
 ENTRY(printascii)
 		addruart r3, r1
 		b	2f
@@ -185,5 +187,7 @@ ENTRY(printch)
 		mov	r0, #0
 		b	1b
 ENDPROC(printch)
+
+#endif
 
 hexbuf:		.space 16

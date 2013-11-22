@@ -285,6 +285,13 @@ config LEDS_DELL_NETBOOKS
 	  This adds support for the Latitude 2100 and similar
 	  notebooks that have an external LED.
 
+config LEDS_STELLARIS
+	tristate "LED Support for Stellaris LEDs"
+	depends on PLAT_STELLARIS
+	help
+	  This option enables support for LEDs connected to GPIO lines
+	  on Texas Instruments Stellaris series CPUs.
+
 config LEDS_TRIGGERS
 	bool "LED Trigger support"
 	help

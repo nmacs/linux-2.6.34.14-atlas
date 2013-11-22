@@ -182,6 +182,9 @@
 /* Aeroflex Gaisler GRLIB APBUART */
 #define PORT_APBUART    90
 
+/* Texas Instruments Stellaris UART */
+#define PORT_STELLARIS  91
+
 #ifdef __KERNEL__
 
 #include <linux/compiler.h>

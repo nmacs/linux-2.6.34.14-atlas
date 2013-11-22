@@ -245,7 +245,11 @@ void __show_regs(struct pt_regs *regs)
 		buf, interrupts_enabled(regs) ? "n" : "ff",
 		fast_interrupts_enabled(regs) ? "n" : "ff",
 		processor_modes[processor_mode(regs)],
+#ifndef CONFIG_CPU_V7M
 		isa_modes[isa_mode(regs)],
+#else
+		"Thumb-2",
+#endif
 		get_fs() == get_ds() ? "kernel" : "user");
 #ifdef CONFIG_CPU_CP15
 	{
@@ -399,6 +403,10 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
 	regs.ARM_r3 = (unsigned long)kernel_thread_exit;
 	regs.ARM_pc = (unsigned long)kernel_thread_helper;
 	regs.ARM_cpsr = SVC_MODE | PSR_ENDSTATE | PSR_ISETSTATE;
+#ifdef CONFIG_CPU_V7M
+	/* Return to Handler mode */
+	regs.ARM_EXC_RET = 0xfffffff1L;
+#endif
 
 	return do_fork(flags|CLONE_VM|CLONE_UNTRACED, 0, &regs, 0, NULL, NULL);
 }

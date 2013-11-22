@@ -132,6 +132,14 @@
 //# endif
 #endif
 
+#if defined(CONFIG_CPU_V7M)
+# ifdef _CACHE
+#  error "Multi-cache not supported on ARMv7-M"
+# else
+#  define _CACHE v7m
+# endif
+#endif
+
 #if !defined(_CACHE) && !defined(MULTI_CACHE)
 #error Unknown cache maintainence model
 #endif
