@@ -38,6 +38,8 @@
 #include <mach/sram.h>
 #include <mach/dma.h>
 
+#include <mach/stellaris_serial_resources.h>
+
 #if !defined(CONFIG_UART_CLOCK_TICK_RATE) || CONFIG_UART_CLOCK_TICK_RATE == 0
 #define CONFIG_UART_CLOCK_TICK_RATE CLOCK_TICK_RATE
 #endif
@@ -908,7 +910,58 @@ static const struct uart_ops ops = {
 
 /****************************************************************************/
 
-static struct stellaris_serial_port ports[STLR_NUARTS];
+static struct stellaris_serial_port ports[STLR_NACTIVEUARTS];
+
+static void __init strl_serial_ports_init()
+{
+	int i;
+	struct stellaris_platform_uart *platp = stellaris_uarts;
+	struct uart_port *port;
+	struct stellaris_serial_port *pp;
+	static int initialized = 0;
+	if (initialized)
+		return;
+	initialized = 1;
+	
+  for (i = 0; i < STLR_NACTIVEUARTS; i++) {
+    pp = ports + i;
+    port = &pp->port;
+
+    pp->uart_index = platp[i].uart_index;
+#ifdef CONFIG_STELLARIS_DMA
+		pp->dma_buffer_size = platp[i].dma_buffer_size;
+
+		pp->dma_tx_channel = platp[i].dma_tx_channel;
+		pp->dma_tx_buffer  = platp[i].dma_tx_buffer;
+		pp->tx_busy        = 0;
+
+		pp->dma_rx_channel = platp[i].dma_rx_channel;
+		pp->rx_slot_a      = platp[i].dma_rx_buffer;
+		pp->rx_slot_b      = (char*)pp->rx_slot_a + RX_SLOT_SIZE(pp);
+		pp->rx_busy        = 0;
+
+		pp->cur_bytes_received = 0;
+
+		pp->rx_timer.function = rx_chars_timeout;
+		pp->rx_timer.data = (unsigned long)pp;
+#endif
+
+		pp->dtr_gpio = platp[i].dtr_gpio;
+		pp->rts_gpio = platp[i].rts_gpio;
+
+		pp->flags = platp[i].flags;
+
+		port->line = i;
+		port->type = PORT_STELLARIS;
+		port->mapbase = platp[i].mapbase;
+		port->membase = (platp[i].membase) ? platp[i].membase : (unsigned char __iomem *) platp[i].mapbase;
+		port->iotype = SERIAL_IO_MEM;
+		port->irq = platp[i].irq;
+		port->uartclk = CONFIG_UART_CLOCK_TICK_RATE;
+		port->ops = &ops;
+		port->flags = ASYNC_BOOT_AUTOCONF;
+	}
+}
 
 /****************************************************************************/
 #if defined(CONFIG_SERIAL_STELLARIS_CONSOLE)
@@ -918,15 +971,15 @@ extern void uart_putc(uint32_t uart_base, const char ch);
 
 static void serial_console_putchar(struct uart_port *port, int ch)
 {
-  uart_putc((uint32_t)port->membase, ch);
+	uart_putc((uint32_t)port->membase, ch);
 }
 
 /****************************************************************************/
 
 static void console_write(struct console *co, const char *s, unsigned int count)
 {
-  struct stellaris_serial_port *uart = &ports[co->index];
-  unsigned long flags;
+	struct stellaris_serial_port *uart = &ports[co->index];
+	unsigned long flags;
 
 	spin_lock_irqsave(&uart->port.lock, flags);
 	uart_console_write(&uart->port, s, count, serial_console_putchar);
@@ -937,23 +990,24 @@ static void console_write(struct console *co, const char *s, unsigned int count)
 
 static int __init console_setup(struct console *co, char *options)
 {
-  struct uart_port *port;
-  int baud = CONFIG_SERIAL_STELLARIS_BAUDRATE;
-  int bits = 8;
-  int parity = 'n';
-  int flow = 'n';
+	struct uart_port *port;
+	int baud = CONFIG_SERIAL_STELLARIS_BAUDRATE;
+	int bits = 8;
+	int parity = 'n';
+	int flow = 'n';
 
-  if ((co->index < 0) || (co->index >= STLR_NUARTS))
-    co->index = 0;
+	if ((co->index < 0) || (co->index >= STLR_NACTIVEUARTS))
+		co->index = 0;
 
-  port = &ports[co->index].port;
-  if (port->membase == 0)
-    return -ENODEV;
+	port = &ports[co->index].port;
 
-  if (options)
-    uart_parse_options(options, &baud, &parity, &bits, &flow);
+	if (port->membase == 0)
+		return -ENODEV;
 
-  return uart_set_options(port, co, baud, parity, bits, flow);
+	if (options)
+		uart_parse_options(options, &baud, &parity, &bits, &flow);
+
+	return uart_set_options(port, co, baud, parity, bits, flow);
 }
 
 /****************************************************************************/
@@ -972,6 +1026,7 @@ static struct console console = {
 
 static int __init stellaris_console_init(void)
 {
+	strl_serial_ports_init();
   register_console(&console);
   return 0;
 }
@@ -1006,58 +1061,26 @@ static struct uart_driver driver = {
 
 static int __devinit probe(struct platform_device *pdev)
 {
-  struct stellaris_platform_uart *platp = pdev->dev.platform_data;
-  struct uart_port *port;
-  struct stellaris_serial_port *pp;
-  int i;
+	struct uart_port *port;
+	struct stellaris_serial_port *pp;
+	int i;
 
-  for (i = 0; ((i < STLR_NUARTS) && (platp[i].mapbase)); i++) {
-    pp = ports + i;
-    port = &pp->port;
+	for (i = 0; i < STLR_NACTIVEUARTS; i++) {
+		pp = ports + i;
+		port = &pp->port;
 
-    pp->uart_index = platp[i].uart_index;
 #ifdef CONFIG_STELLARIS_DMA
-		pp->dma_buffer_size = platp[i].dma_buffer_size;
-
-		pp->dma_tx_channel = platp[i].dma_tx_channel;
-		pp->dma_tx_buffer  = platp[i].dma_tx_buffer;
-		pp->tx_busy        = 0;
-
-		pp->dma_rx_channel = platp[i].dma_rx_channel;
-		pp->rx_slot_a      = platp[i].dma_rx_buffer;
-		pp->rx_slot_b      = (char*)pp->rx_slot_a + RX_SLOT_SIZE(pp);
-		pp->rx_busy        = 0;
-
-		pp->cur_bytes_received = 0;
-
 		tasklet_init(&pp->rx_tasklet, do_rx_chars, (unsigned long)pp);
 		tasklet_disable(&pp->rx_tasklet);
 		init_timer(&pp->rx_timer);
-		pp->rx_timer.function = rx_chars_timeout;
-		pp->rx_timer.data = (unsigned long)pp;
 #endif
 
-		pp->dtr_gpio = platp[i].dtr_gpio;
-		pp->rts_gpio = platp[i].rts_gpio;
+		port->dev = &pdev->dev;
 
-		pp->flags = platp[i].flags;
+		uart_add_one_port(&driver, port);
+	}
 
-    port->dev = &pdev->dev;
-    port->line = i;
-    port->type = PORT_STELLARIS;
-    port->mapbase = platp[i].mapbase;
-    port->membase = (platp[i].membase) ? platp[i].membase :
-      (unsigned char __iomem *) platp[i].mapbase;
-    port->iotype = SERIAL_IO_MEM;
-    port->irq = platp[i].irq;
-    port->uartclk = CONFIG_UART_CLOCK_TICK_RATE;
-    port->ops = &ops;
-    port->flags = ASYNC_BOOT_AUTOCONF;
-
-    uart_add_one_port(&driver, port);
-  }
-
-  return 0;
+	return 0;
 }
 
 /****************************************************************************/
