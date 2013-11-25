@@ -49,6 +49,18 @@ config CRYPTO_DEV_PADLOCK_SHA
 	  If unsure say M. The compiled module will be
 	  called padlock-sha.
 
+config CRYPTO_DEV_CCM_AES
+	bool "CCM driver for AES algorithm"
+	depends on ARCH_TM4C
+	select CRYPTO_BLKCIPHER
+	select CRYPTO_AES
+
+config CRYPTO_DEV_CCM_SHA
+	bool "CCM driver for SHA1 algorithm"
+	depends on ARCH_TM4C
+	select CRYPTO_HASH
+	select CRYPTO_SHA1
+
 config CRYPTO_DEV_GEODE
 	tristate "Support for the Geode LX AES engine"
 	depends on X86_32 && PCI
