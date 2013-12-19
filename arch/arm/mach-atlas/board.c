@@ -40,7 +40,19 @@ static struct resource board_spi_resources0[] = {
   },
 };
 
-static int board_spi_cs[] = {GPIO_SSI0_CS_SF, GPIO_SSI0_CS_EE, GPIO_SSI0_CS_ETH, GPIO_TL_SPI_MRDY};
+static struct resource board_spi_resources1[] = {
+  {
+         .start = STLR_SSI1_BASE,
+         .end = STLR_SSI1_BASE + SZ_1K - 1,
+         .flags = IORESOURCE_MEM,
+  }, {
+         .start = STLR_SSI1_IRQ,
+         .end = STLR_SSI1_IRQ,
+         .flags = IORESOURCE_IRQ,
+  },
+};
+
+static int board_spi0_cs[] = {GPIO_SSI_CS_SF, GPIO_SSI_CS_EE};
 
 #ifdef CONFIG_STELLARIS_DMA
 char __sramdata ssi0_dma_rx_buffer[DMA_MAX_TRANSFER_SIZE];
@@ -48,13 +60,31 @@ char __sramdata ssi0_dma_tx_buffer[DMA_MAX_TRANSFER_SIZE];
 #endif
 
 static struct spi_stellaris_master board_spi_0_data = {
-  .chipselect = board_spi_cs,
-  .num_chipselect = ARRAY_SIZE(board_spi_cs),
+  .chipselect = board_spi0_cs,
+  .num_chipselect = ARRAY_SIZE(board_spi0_cs),
 #ifdef CONFIG_STELLARIS_DMA
 	.dma_rx_channel = DMA_CHANNEL_SSI0_RX,
 	.dma_tx_channel = DMA_CHANNEL_SSI0_TX,
 	.dma_rx_buffer = ssi0_dma_rx_buffer,
 	.dma_tx_buffer = ssi0_dma_tx_buffer,
+#endif
+};
+
+static int board_spi1_cs[] = {GPIO_SSI_CS_ETH};
+
+#ifdef CONFIG_STELLARIS_DMA
+char __sramdata ssi1_dma_rx_buffer[DMA_MAX_TRANSFER_SIZE];
+char __sramdata ssi1_dma_tx_buffer[DMA_MAX_TRANSFER_SIZE];
+#endif
+
+static struct spi_stellaris_master board_spi_1_data = {
+  .chipselect = board_spi1_cs,
+  .num_chipselect = ARRAY_SIZE(board_spi1_cs),
+#ifdef CONFIG_STELLARIS_DMA
+	.dma_rx_channel = DMA_CHANNEL_SSI1_RX,
+	.dma_tx_channel = DMA_CHANNEL_SSI1_TX,
+	.dma_rx_buffer = ssi1_dma_rx_buffer,
+	.dma_tx_buffer = ssi1_dma_tx_buffer,
 #endif
 };
 
@@ -64,6 +94,14 @@ struct platform_device board_spi_device0 = {
   .num_resources = ARRAY_SIZE(board_spi_resources0),
   .resource = board_spi_resources0,
   .dev.platform_data = &board_spi_0_data,
+};
+
+struct platform_device board_spi_device1 = {
+  .name = "stellaris-spi",
+  .id = 1,
+  .num_resources = ARRAY_SIZE(board_spi_resources1),
+  .resource = board_spi_resources1,
+  .dev.platform_data = &board_spi_1_data,
 };
 
 static struct mtd_partition flash_partitions[] = {
@@ -78,7 +116,7 @@ static struct flash_platform_data flash_chip = {
   .name     = "flash",
   .parts    = flash_partitions,
   .nr_parts = ARRAY_SIZE(flash_partitions),
-  .type     = "m25p32",
+  .type     = "w25q64",
 };
 
 static struct spi_eeprom eeprom_chip = {
@@ -90,7 +128,7 @@ static struct spi_eeprom eeprom_chip = {
 
 static struct spi_board_info spi_devices[] = {
   {
-    .modalias      = "m25p32",
+    .modalias      = "w25q64",
     .max_speed_hz  = 10 * 1000000,
     .bus_num       = 0,
     .chip_select   = 0,
@@ -106,8 +144,8 @@ static struct spi_board_info spi_devices[] = {
   {
     .modalias      = "ks8851",
     .max_speed_hz  = 5 * 1000000,
-    .bus_num       = 0,
-    .chip_select   = 2,
+    .bus_num       = 1,
+    .chip_select   = 0,
     .irq           = STLR_GPIOF_IRQ, // ETH IRQ on PG5
   }
 };
@@ -169,7 +207,6 @@ static struct telit_platform_data telit_pdata = {
 	.pwr_on_gpio   = GPIO_TL_PWR_ON,
 	.shutdown_gpio = GPIO_TL_SHUTDOWN,
 	.if_en_gpio    = GPIO_TL_IF_EN,
-	.spi_srdy_gpio = GPIO_TL_SPI_SRDY,
 };
 
 static struct platform_device telit_device = {
@@ -183,6 +220,7 @@ static struct platform_device telit_device = {
 static struct platform_device *devices[] = {
   &uart_device,
   &board_spi_device0,
+	&board_spi_device1,
 	&wdt_device,
 #ifdef CONFIG_ATLAS_CPU_LED
 	&cpu_led,

@@ -17,6 +17,9 @@
 
 #if CONFIG_DRAM_SIZE == 8*1024*1024
 #  define DRAM_SIZE_POW2 23
+#  define REGION_SIZE_CODE 13
+#elif CONFIG_DRAM_SIZE == 32*1024*1024
+#  define DRAM_SIZE_POW2 25
 #else
 #  error "Unknown DRAM size"
 #endif
@@ -139,7 +142,7 @@ static int __init init_mpu(void)
 		              (0x03 << MPU_ATTR_AP_SHIFT) |                           // Set AP to 0x03 (enable full access)
 		              MPU_ATTR_SRD_MASK |                                     // Disable all subregions
 		              MPU_ATTR_ENABLE_MASK |                                  // Enable region
-		              ((0x13) << MPU_ATTR_SIZE_SHIFT),                        // Set region size 1MiB = 2^(0x13+1)
+		              ((MPU_REGION_SIZE_POW2 - 1) << MPU_ATTR_SIZE_SHIFT),    // Set region size
 									STLR_MPU_ATTR);
 
 		asm("dsb":::);
