@@ -18,6 +18,17 @@
 //#define DEBUG 1
 //#define VERBOSE_DEBUG 1
 
+#if 1
+#  define FILTER(port) if((port)->line == 3)
+#else
+#  define FILTER(port)
+#endif
+
+#define uart_err(port, format, ...) dev_err((port)->dev, "[UART %u] " format, (port)->line, ## __VA_ARGS__)
+#define uart_notice(port, format, ...) dev_notice((port)->dev, "[UART %u] " format, (port)->line, ## __VA_ARGS__)
+#define uart_dbg(port, format, ...) FILTER(port) dev_dbg((port)->dev, "[UART %u] " format, (port)->line, ## __VA_ARGS__)
+#define uart_vdbg(port, format, ...) FILTER(port) dev_vdbg((port)->dev, "[UART %u] " format, (port)->line, ## __VA_ARGS__)
+
 /****************************************************************************/
 
 #include <linux/kernel.h>
@@ -81,8 +92,10 @@ struct stellaris_serial_port {
 /****************************************************************************/
 
 static int __sram tx_chars(struct stellaris_serial_port *pp);
+static void __sram rx_chars(struct stellaris_serial_port *pp, int timeout);
 static void __sram start_rx_dma(struct stellaris_serial_port *pp);
 static void stop_rx(struct uart_port *port);
+static irqreturn_t __sram interrupt(int irq, void *data);
 
 /****************************************************************************/
 
@@ -90,7 +103,7 @@ static void stop_rx(struct uart_port *port);
 
 static void start_dma_rx(struct stellaris_serial_port *pp)
 {
-	dev_vdbg(pp->port.dev, "%s\n", __func__);
+	uart_vdbg(&pp->port, "%s\n", __func__);
 	dma_start_xfer(pp->dma_rx_channel);
 #ifdef CONFIG_ARCH_TM4C
 	{
@@ -103,7 +116,7 @@ static void start_dma_rx(struct stellaris_serial_port *pp)
 
 static void stop_dma_rx(struct stellaris_serial_port *pp)
 {
-	dev_vdbg(pp->port.dev, "%s\n", __func__);
+	uart_vdbg(&pp->port, "%s\n", __func__);
 	dma_stop_xfer(pp->dma_rx_channel);
 #ifdef CONFIG_ARCH_TM4C
 	{
@@ -117,7 +130,7 @@ static void stop_dma_rx(struct stellaris_serial_port *pp)
 
 static void start_dma_tx(struct stellaris_serial_port *pp)
 {
-	dev_vdbg(pp->port.dev, "%s\n", __func__);
+	uart_vdbg(&pp->port, "%s\n", __func__);
 	dma_start_xfer(pp->dma_tx_channel);
 #ifdef CONFIG_ARCH_TM4C
 	{
@@ -130,7 +143,7 @@ static void start_dma_tx(struct stellaris_serial_port *pp)
 
 static void stop_dma_tx(struct stellaris_serial_port *pp)
 {
-	dev_vdbg(pp->port.dev, "%s\n", __func__);
+	uart_vdbg(&pp->port, "%s\n", __func__);
 	dma_stop_xfer(pp->dma_tx_channel);
 #ifdef CONFIG_ARCH_TM4C
 	{
@@ -148,7 +161,7 @@ static void enable_uart(struct uart_port *port)
   uint32_t regval;
   struct stellaris_serial_port *pp = container_of(port, struct stellaris_serial_port, port);
 
-	dev_vdbg(port->dev, "%s\n", __func__);
+	uart_vdbg(port, "%s\n", __func__);
 
 	uart_clock_ctrl(pp->uart_index, SYS_ENABLE_CLOCK);
 	
@@ -173,17 +186,19 @@ static void enable_uart(struct uart_port *port)
   putreg32(regval, port->membase + STLR_UART_CTL_OFFSET);
 
 #ifdef CONFIG_STELLARIS_DMA
-	dev_vdbg(port->dev, "%s enable port dma\n", __func__);
+	if (pp->dma_buffer_size) {
+		uart_vdbg(port, "%s: enable port dma\n", __func__);
 #if defined(CONFIG_ARCH_TM4C)
-	putreg32(UART_IM_DMARX | UART_IM_DMATX,
-	              port->membase + STLR_UART_IM_OFFSET);
+		putreg32(UART_IM_DMARX | UART_IM_DMATX,
+		         port->membase + STLR_UART_IM_OFFSET);
 #elif defined(CONFIG_ARCH_LM3S)
-	putreg32(UART_DMACTL_TXDMAE | UART_DMACTL_RXDMAE,
-	              port->membase + STLR_UART_DMACTL_OFFSET);
+		putreg32(UART_DMACTL_TXDMAE | UART_DMACTL_RXDMAE,
+		         port->membase + STLR_UART_DMACTL_OFFSET);
 #endif
-	pp->tx_busy = 0;
-	pp->rx_busy = 0;
-	tasklet_enable(&pp->rx_tasklet);
+		pp->tx_busy = 0;
+		pp->rx_busy = 0;
+		tasklet_enable(&pp->rx_tasklet);
+	}
 #endif
 }
 
@@ -192,16 +207,18 @@ static void disable_uart(struct uart_port *port)
   uint32_t regval;
   struct stellaris_serial_port *pp = container_of(port, struct stellaris_serial_port, port);
 
-	dev_vdbg(port->dev, "%s\n", __func__);
+	uart_vdbg(port, "%s\n", __func__);
 
   /* Disable all interrupts now */
 	putreg32(0, port->membase + STLR_UART_IM_OFFSET);
 
 #ifdef CONFIG_STELLARIS_DMA
-	tasklet_disable(&pp->rx_tasklet);
-	tasklet_kill(&pp->rx_tasklet);
-	del_timer_sync(&pp->rx_timer);
-	stop_dma_tx(pp);
+	if (pp->dma_buffer_size) {
+		tasklet_disable(&pp->rx_tasklet);
+		tasklet_kill(&pp->rx_tasklet);
+		del_timer_sync(&pp->rx_timer);
+		stop_dma_tx(pp);
+	}
 #endif
 
   regval = getreg32(port->membase + STLR_UART_CTL_OFFSET);
@@ -223,8 +240,8 @@ static unsigned int tx_empty(struct uart_port *port)
 
 static unsigned int get_mctrl(struct uart_port *port)
 {
-	dev_vdbg(port->dev, "%s\n", __func__);
-  // TODO: Implement for UART1
+	uart_vdbg(port, "%s\n", __func__);
+  // TODO: Implement for UART0
   return TIOCM_CAR | TIOCM_CTS | TIOCM_DSR;
 }
 
@@ -233,49 +250,30 @@ static unsigned int get_mctrl(struct uart_port *port)
 static void set_mctrl(struct uart_port *port, unsigned int mctrl)
 {
 	struct stellaris_serial_port *pp = container_of(port, struct stellaris_serial_port, port);
-//	uint32_t regval = 0;
 
-	dev_vdbg(port->dev, "%s [mmio:%p]\n", __func__, port->membase);
+	uart_vdbg(port, "%s\n", __func__);
 
-//	regval = getreg32(port->membase + STLR_UART_CTL_OFFSET);
-
-	if (pp->flags & STLR_UART_HAS_RTS)
-	{
-		if (mctrl & TIOCM_RTS)
-		{
+	if (pp->flags & STLR_UART_HAS_RTS) {
+		if (mctrl & TIOCM_RTS) {
 			if (pp->rts_gpio)
 				gpiowrite(pp->rts_gpio, pp->flags & STLR_UART_INVERT_RTS ? 0 : 1);
-//			else
-//				regval |= UART_CTL_RTS;
 		}
-		else
-		{
+		else {
 			if (pp->rts_gpio)
 				gpiowrite(pp->rts_gpio, pp->flags & STLR_UART_INVERT_RTS ? 1 : 0);
-//			else
-//				regval &= ~UART_CTL_RTS;
 		}
 	}
 
-	if (pp->flags & STLR_UART_HAS_DTR)
-	{
-		if (mctrl & TIOCM_DTR)
-		{
+	if (pp->flags & STLR_UART_HAS_DTR) {
+		if (mctrl & TIOCM_DTR) {
 			if (pp->dtr_gpio)
 				gpiowrite(pp->rts_gpio, pp->flags & STLR_UART_INVERT_DTR ? 0 : 1);
-//			else
-//				regval |= UART_CTL_DTR;
 		}
-		else
-		{
+		else {
 			if (pp->dtr_gpio)
 				gpiowrite(pp->rts_gpio, pp->flags & STLR_UART_INVERT_DTR ? 1 : 0);
-//			else
-//				regval &= ~UART_CTL_DTR;
 		}
 	}
-	
-	//putreg32(regval, port->membase + STLR_UART_CTL_OFFSET);
 }
 
 /****************************************************************************/
@@ -285,22 +283,22 @@ static void start_tx(struct uart_port *port)
   uint32_t regval;
   struct stellaris_serial_port *pp = container_of(port, struct stellaris_serial_port, port);
 
-  dev_dbg(port->dev, "%s\n", __func__);
-
-	regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
+  uart_dbg(port, "%s\n", __func__);
 
 #ifdef CONFIG_STELLARIS_DMA
-	if( !pp->tx_busy )
-		tx_chars(pp);
-  else
-		dev_dbg(port->dev, "%s port busy\n", __func__);
-#else
-	if(tx_chars(pp) )
-	{
+	if (pp->dma_buffer_size) {
+		if( !pp->tx_busy )
+			tx_chars(pp);
+		else
+			uart_dbg(port, "%s: port busy\n", __func__);
+	}
+	else
+#endif
+	if (tx_chars(pp)) {
+		regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
 		regval |= UART_IM_TXIM;
 		putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
 	}
-#endif
 }
 
 /****************************************************************************/
@@ -309,20 +307,23 @@ static void stop_tx(struct uart_port *port)
 {
 #ifdef CONFIG_STELLARIS_DMA
 	struct stellaris_serial_port *pp = container_of(port, struct stellaris_serial_port, port);
-#else
-	uint32_t regval;
 #endif
+	uint32_t regval;
 
-  dev_dbg(port->dev, "%s\n", __func__);
+  uart_dbg(port, "%s\n", __func__);
 
 #ifdef CONFIG_STELLARIS_DMA
-	stop_dma_tx(pp);
-	pp->tx_busy = 0;
-#else
-  regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
-  regval &= ~UART_IM_TXIM;
-  putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
+	if (pp->dma_buffer_size) {
+		stop_dma_tx(pp);
+		pp->tx_busy = 0;
+	}
+	else
 #endif
+	{
+		regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
+		regval &= ~UART_IM_TXIM;
+		putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
+	}
 }
 
 /****************************************************************************/
@@ -331,21 +332,24 @@ static void stop_rx(struct uart_port *port)
 {
 #ifdef CONFIG_STELLARIS_DMA
 	struct stellaris_serial_port *pp = container_of(port, struct stellaris_serial_port, port);
-#else
-	uint32_t regval;
 #endif
+	uint32_t regval;
 
-  dev_dbg(port->dev, "%s\n", __func__);
+  uart_dbg(port, "%s\n", __func__);
 
 #ifdef CONFIG_STELLARIS_DMA
-	tasklet_kill(&pp->rx_tasklet);
-	del_timer_sync(&pp->rx_timer);
-	stop_dma_rx(pp);
-#else
-  regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
-  regval &= ~(UART_IM_RXIM | UART_IM_RTIM);
-  putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
+	if (pp->dma_buffer_size) {
+		tasklet_kill(&pp->rx_tasklet);
+		del_timer_sync(&pp->rx_timer);
+		stop_dma_rx(pp);
+	}
+	else
 #endif
+	{
+		regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
+		regval &= ~(UART_IM_RXIM | UART_IM_RTIM);
+		putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
+	}
 }
 
 /****************************************************************************/
@@ -355,7 +359,7 @@ static void break_ctl(struct uart_port *port, int break_state)
   unsigned long flags;
   uint32_t regval;
 
-  dev_dbg(port->dev, "%s\n", __func__);
+  uart_dbg(port, "%s\n", __func__);
 
   spin_lock_irqsave(&port->lock, flags);
 
@@ -386,19 +390,28 @@ static int startup(struct uart_port *port)
 	struct stellaris_serial_port *pp = container_of(port, struct stellaris_serial_port, port);
 #endif
 
-  dev_dbg(port->dev, "%s\n", __func__);
+  uart_dbg(port, "%s\n", __func__);
+	
+	if (request_irq(port->irq, interrupt, IRQF_DISABLED, "UART", port)) {
+		uart_err(port, "%s: unable to attach irq=%d\n", __func__, port->irq);
+		return -EBUSY;
+	}
 
   spin_lock_irqsave(&port->lock, flags);
 
   enable_uart(port);
-
+	
 #ifdef CONFIG_STELLARIS_DMA
-	start_rx_dma(pp);
-#else
-  /* Enable RX interrupts now */
-  putreg32(UART_IM_RXIM | UART_IM_RTIM,
-                port->membase + STLR_UART_IM_OFFSET);
+	if (pp->dma_buffer_size)
+		start_rx_dma(pp);
+	else
 #endif
+	{
+		/* Enable RX interrupts now */
+		uint32_t regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
+		regval |= UART_IM_RXIM | UART_IM_RTIM;
+		putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
+	}
 
   spin_unlock_irqrestore(&port->lock, flags);
 
@@ -409,8 +422,9 @@ static int startup(struct uart_port *port)
 
 static void shutdown(struct uart_port *port)
 {
-	dev_dbg(port->dev, "%s\n", __func__);
+	uart_dbg(port, "%s\n", __func__);
 	disable_uart(port);
+	free_irq(port->irq, port);
 }
 
 /****************************************************************************/
@@ -424,7 +438,7 @@ static void set_termios(struct uart_port *port, struct ktermios *termios,
 
   baud = uart_get_baud_rate(port, termios, old, 0, 230400);
 
-  dev_dbg(port->dev, "%s: membase %p, new baud %u\n", __func__, port->membase, baud);
+  uart_dbg(port, "%s: new baud %u\n", __func__, baud);
 
   /* Calculate BAUD rate from the SYS clock:
    *
@@ -542,7 +556,9 @@ static void __sram start_rx_dma(struct stellaris_serial_port *pp)
 {
 	struct uart_port *port = &pp->port;
 	void *slot = pp->rx_slot_a;
-
+	
+	uart_vdbg(port, "%s\n", __func__);
+	
 	dma_setup_xfer(pp->dma_rx_channel,
 	               slot,
 	               port->membase + STLR_UART_DR_OFFSET,
@@ -557,13 +573,13 @@ static void __sram start_rx_dma(struct stellaris_serial_port *pp)
 	start_dma_rx(pp);
 }
 
-static void __sram rx_chars(struct stellaris_serial_port *pp, int timeout);
-
 static void __sram rx_chars_timeout(unsigned long data)
 {
 	struct stellaris_serial_port *pp = (struct stellaris_serial_port*)data;
 	struct uart_port *port = &pp->port;
 	unsigned long flags;
+	
+	uart_vdbg(port, "%s\n", __func__);
 
 	spin_lock_irqsave(&port->lock, flags);
 	rx_chars(pp, 1 /*timeout*/);
@@ -579,7 +595,7 @@ static void __sram do_rx_chars(unsigned long data)
 	int bytes_received = pp->cur_bytes_received;
 	unsigned long flags;
 
-	dev_vdbg(port->dev, "%s bytes_received %i\n", __func__, bytes_received);
+	uart_vdbg(port, "%s: bytes received %i\n", __func__, bytes_received);
 
 	tty_insert_flip_string(tty, slot, bytes_received);
 	port->icount.rx += bytes_received;
@@ -598,98 +614,103 @@ static void __sram rx_chars(struct stellaris_serial_port *pp, int timeout)
 	struct uart_port *port = &pp->port;
 #ifdef CONFIG_STELLARIS_DMA
 	int bytes_received;
-#else
+#endif
   unsigned char ch;
   unsigned int flag;
   unsigned int status, rxdata;
-#endif
 
-  dev_vdbg(port->dev, "%s\n", __func__);
+  uart_vdbg(port, "%s\n", __func__);
 
 #ifdef CONFIG_STELLARIS_DMA
-	if (get_units_left(pp->dma_rx_channel, 1) != 0) {
-		if (!timeout) {
-			mod_timer(&pp->rx_timer, jiffies + 1);
+	if (pp->dma_buffer_size) {
+		if (get_units_left(pp->dma_rx_channel, 1) != 0) {
+			if (!timeout) {
+				mod_timer(&pp->rx_timer, jiffies + 1);
+				return;
+			}
+		}
+
+		if (!timeout)
+			del_timer(&pp->rx_timer);
+
+		if( pp->rx_busy )
+		{
+			if (get_units_left(pp->dma_rx_channel, 1) == 0)
+			{
+				stop_dma_rx(pp);
+				port->icount.overrun++;
+				uart_notice(port, "%s: overrun detected\n", __func__);
+			}
+			uart_vdbg(port, "%s: rx_busy\n", __func__);
 			return;
 		}
-	}
 
-	if (!timeout)
-		del_timer(&pp->rx_timer);
+		stop_dma_rx(pp);
 
-	if( pp->rx_busy )
-	{
-		if (get_units_left(pp->dma_rx_channel, 1) == 0)
+		swap(pp->rx_slot_a, pp->rx_slot_b);
+
+		bytes_received  = RX_SLOT_SIZE(pp);
+		bytes_received -= get_units_left(pp->dma_rx_channel, 0);
+		bytes_received -= get_units_left(pp->dma_rx_channel, 1);
+		
+		start_rx_dma(pp);
+		
+		uart_vdbg(port, "%s: bytes received %i\n", __func__, bytes_received);
+
+		if( bytes_received > 0 )
 		{
-			stop_dma_rx(pp);
-			port->icount.overrun++;
-			dev_notice(port->dev, "%s: overrun detected [mmio:%p]\n", __func__, port->membase);
+			pp->cur_bytes_received = bytes_received;
+			pp->rx_busy = 1;
+			tasklet_schedule(&pp->rx_tasklet);
 		}
-		dev_vdbg(port->dev, "%s rx_busy\n", __func__);
-		return;
 	}
-
-	stop_dma_rx(pp);
-
-	swap(pp->rx_slot_a, pp->rx_slot_b);
-
-	bytes_received  = RX_SLOT_SIZE(pp);
-	bytes_received -= get_units_left(pp->dma_rx_channel, 0);
-	bytes_received -= get_units_left(pp->dma_rx_channel, 1);
-
-	start_rx_dma(pp);
-	
-	dev_vdbg(port->dev, "%s bytes_received %i\n", __func__, bytes_received);
-
-	if( bytes_received > 0 )
-	{
-		pp->cur_bytes_received = bytes_received;
-		pp->rx_busy = 1;
-		tasklet_schedule(&pp->rx_tasklet);
-	}
-#else
-  while( ((getreg32(port->membase + STLR_UART_FR_OFFSET)) & UART_FR_RXFE) == 0 )
-  {
-    rxdata = getreg32(port->membase + STLR_UART_DR_OFFSET);
-    ch = (unsigned char)(rxdata & UART_DR_DATA_MASK);
-    status = rxdata & ~UART_DR_DATA_MASK;
-
-    flag = TTY_NORMAL;
-    port->icount.rx++;
-
-    if (status & UART_DR_BE) {
-      port->icount.brk++;
-      if (uart_handle_break(port))
-        continue;
-    } else if (status & UART_DR_PE) {
-      port->icount.parity++;
-    } else if (status & UART_DR_OE) {
-      port->icount.overrun++;
-    } else if (status & UART_DR_FE) {
-      port->icount.frame++;
-    }
-
-    status &= port->read_status_mask;
-
-    if (status & UART_DR_BE)
-      flag = TTY_BREAK;
-    else if (status & UART_DR_PE)
-      flag = TTY_PARITY;
-    else if (status & UART_DR_FE)
-      flag = TTY_FRAME;
-
-    //if (uart_handle_sysrq_char(port, ch))
-      //continue;
-    //uart_insert_char(port, status, UART_DR_OE, ch, flag);
-
-		{
-			struct tty_struct *tty = port->state->port.tty;
-			tty_insert_flip_char(tty, ch, flag);
-		}
-  }
-
-  tty_flip_buffer_push(port->state->port.tty);
+	else
 #endif
+	{
+		while( ((getreg32(port->membase + STLR_UART_FR_OFFSET)) & UART_FR_RXFE) == 0 )
+		{
+			rxdata = getreg32(port->membase + STLR_UART_DR_OFFSET);
+			ch = (unsigned char)(rxdata & UART_DR_DATA_MASK);
+			status = rxdata & ~UART_DR_DATA_MASK;
+
+			flag = TTY_NORMAL;
+			port->icount.rx++;
+
+			if (status & UART_DR_BE) {
+				port->icount.brk++;
+				if (uart_handle_break(port))
+					continue;
+			} else if (status & UART_DR_PE) {
+				port->icount.parity++;
+			} else if (status & UART_DR_OE) {
+				port->icount.overrun++;
+			} else if (status & UART_DR_FE) {
+				port->icount.frame++;
+			}
+
+			status &= port->read_status_mask;
+
+			if (status & UART_DR_BE)
+				flag = TTY_BREAK;
+			else if (status & UART_DR_PE)
+				flag = TTY_PARITY;
+			else if (status & UART_DR_FE)
+				flag = TTY_FRAME;
+
+			//if (uart_handle_sysrq_char(port, ch))
+				//continue;
+			//uart_insert_char(port, status, UART_DR_OE, ch, flag);
+
+			{
+				struct tty_struct *tty = port->state->port.tty;
+				tty_insert_flip_char(tty, ch, flag);
+			}
+			
+			uart_vdbg(port, "%s: char %c\n", __func__, ch);
+		}
+
+		tty_flip_buffer_push(port->state->port.tty);
+	}
 }
 
 /****************************************************************************/
@@ -701,22 +722,25 @@ static int __sram tx_chars(struct stellaris_serial_port *pp)
 #ifdef CONFIG_STELLARIS_DMA
 	size_t xfer_size;
 	size_t bytes_to_transmit;
-#else
-	uint32_t regval;
 #endif
+	uint32_t regval;
 
-  dev_vdbg(port->dev, "%s\n", __func__);
+  uart_vdbg(port, "%s\n", __func__);
 
   if (uart_circ_empty(xmit) || uart_tx_stopped(port)) {
-		dev_vdbg(port->dev, "%s TX complete\n", __func__);
+		uart_vdbg(port, "%s: tx complete\n", __func__);
 #ifdef CONFIG_STELLARIS_DMA
-		stop_dma_tx(pp);
-		pp->tx_busy = 0;
-#else
-		regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
-    regval &= ~UART_IM_TXIM;
-    putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
+		if (pp->dma_buffer_size) {
+			stop_dma_tx(pp);
+			pp->tx_busy = 0;
+		}
+		else
 #endif
+		{
+			regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
+			regval &= ~UART_IM_TXIM;
+			putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
+		}
     return 0;
   }
 
@@ -728,44 +752,48 @@ static int __sram tx_chars(struct stellaris_serial_port *pp)
   }
 
 #ifdef CONFIG_STELLARIS_DMA
-	pp->tx_busy = 1;
-	bytes_to_transmit = CIRC_CNT_TO_END(xmit->head, xmit->tail, UART_XMIT_SIZE);
-  xfer_size = min(bytes_to_transmit, pp->dma_buffer_size);
-	dma_memcpy(pp->dma_tx_buffer, xmit->buf + xmit->tail, xfer_size);
-	xmit->tail = (xmit->tail + xfer_size) & (UART_XMIT_SIZE - 1);
-	dma_setup_xfer(pp->dma_tx_channel,
-								 port->membase + STLR_UART_DR_OFFSET,
-								 pp->dma_tx_buffer,
-								 xfer_size,
-								 DMA_XFER_MEMORY_TO_DEVICE | DMA_XFER_UNIT_BYTE);
-	
-	dev_vdbg(port->dev, "%s: dma_ch %x, xfer_size %u, dst %p\n",
-					 __func__, pp->dma_tx_channel, xfer_size, port->membase + STLR_UART_DR_OFFSET);
-	
-	start_dma_tx(pp);
+	if (pp->dma_buffer_size) {
+		pp->tx_busy = 1;
+		bytes_to_transmit = CIRC_CNT_TO_END(xmit->head, xmit->tail, UART_XMIT_SIZE);
+		xfer_size = min(bytes_to_transmit, pp->dma_buffer_size);
+		dma_memcpy(pp->dma_tx_buffer, xmit->buf + xmit->tail, xfer_size);
+		xmit->tail = (xmit->tail + xfer_size) & (UART_XMIT_SIZE - 1);
+		dma_setup_xfer(pp->dma_tx_channel,
+									port->membase + STLR_UART_DR_OFFSET,
+									pp->dma_tx_buffer,
+									xfer_size,
+									DMA_XFER_MEMORY_TO_DEVICE | DMA_XFER_UNIT_BYTE);
+		
+		uart_vdbg(port, "%s: dma_ch %x, xfer_size %u, dst %p\n",
+						__func__, pp->dma_tx_channel, xfer_size, port->membase + STLR_UART_DR_OFFSET);
+		
+		start_dma_tx(pp);
 
-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
-    uart_write_wakeup(port);
-#else
-  while ((getreg32(port->membase + STLR_UART_FR_OFFSET) & UART_FR_TXFF) == 0) {
-    if (xmit->head == xmit->tail)
-      break;
-    putreg32(xmit->buf[xmit->tail], port->membase + STLR_UART_DR_OFFSET);
-    xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE -1);
-    port->icount.tx++;
-  }
-
-  if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
-    uart_write_wakeup(port);
-
-  if (xmit->head == xmit->tail) {
-		dev_vdbg(port->dev, "%s TX complete\n", __func__);
-    regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
-    regval &= ~UART_IM_TXIM;
-    putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
-    return 0;
-  }
+		if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+			uart_write_wakeup(port);
+	}
+	else
 #endif
+	{
+		while ((getreg32(port->membase + STLR_UART_FR_OFFSET) & UART_FR_TXFF) == 0) {
+			if (xmit->head == xmit->tail)
+				break;
+			putreg32(xmit->buf[xmit->tail], port->membase + STLR_UART_DR_OFFSET);
+			xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE -1);
+			port->icount.tx++;
+		}
+
+		if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+			uart_write_wakeup(port);
+
+		if (xmit->head == xmit->tail) {
+			uart_vdbg(port, "%s: tx complete\n", __func__);
+			regval = getreg32(port->membase + STLR_UART_IM_OFFSET);
+			regval &= ~UART_IM_TXIM;
+			putreg32(regval, port->membase + STLR_UART_IM_OFFSET);
+			return 0;
+		}
+	}
 
   return 1;
 }
@@ -781,50 +809,48 @@ static irqreturn_t __sram interrupt(int irq, void *data)
   isr = getreg32(port->membase + STLR_UART_MIS_OFFSET);
   putreg32(isr, port->membase + STLR_UART_ICR_OFFSET);
 
-	dev_vdbg(port->dev, "%s ISR 0x%x\n", __func__, isr);
+	uart_vdbg(port, "%s: ISR 0x%x\n", __func__, isr);
 
 #ifdef CONFIG_STELLARIS_DMA
+	if (pp->dma_buffer_size) {
 #if defined(CONFIG_ARCH_LM3S)
-	if (dma_ack_interrupt(pp->dma_rx_channel))
-	{
-		dev_vdbg(port->dev, "%s RX\n", __func__);
-		rx_chars(pp, 0);
-	}
+		if (dma_ack_interrupt(pp->dma_rx_channel)) {
+			uart_vdbg(port, "%s: rx\n", __func__);
+			rx_chars(pp, 0);
+		}
 
-	if (dma_ack_interrupt(pp->dma_tx_channel))
-	{
-		dev_vdbg(port->dev, "%s TX\n", __func__);
-		tx_chars(pp);
-	}
+		if (dma_ack_interrupt(pp->dma_tx_channel)) {
+			uart_vdbg(port, "%s: tx\n", __func__);
+			tx_chars(pp);
+		}
 #elif defined(CONFIG_ARCH_TM4C)
-	if (isr & UART_RIS_DMARX)
-	{
-		dev_vdbg(port->dev, "%s RX\n", __func__);
-		rx_chars(pp, 0);
-	}
+		if (isr & UART_RIS_DMARX) {
+			uart_vdbg(port, "%s: rx\n", __func__);
+			rx_chars(pp, 0);
+		}
 
-	if (isr & UART_RIS_DMATX)
-	{
-		dev_vdbg(port->dev, "%s TX\n", __func__);
-		stop_dma_tx(pp);
-		tx_chars(pp);
-	}
+		if (isr & UART_RIS_DMATX) {
+			uart_vdbg(port, "%s: tx\n", __func__);
+			stop_dma_tx(pp);
+			tx_chars(pp);
+		}
 #endif
-#else
-  if (isr & (UART_MIS_RXMIS | UART_MIS_RTMIS))
-	{
-		dev_vdbg(port->dev, "%s RX\n", __func__);
-    rx_chars(pp, 0);
 	}
-
-  if (isr & UART_MIS_TXMIS)
-	{
-		dev_vdbg(port->dev, "%s TX\n", __func__);
-    tx_chars(pp);
-	}
+	else
 #endif
+	{
+		if (isr & (UART_MIS_RXMIS | UART_MIS_RTMIS)) {
+			uart_vdbg(port, "%s: rx\n", __func__);
+			rx_chars(pp, 0);
+		}
 
-	dev_vdbg(port->dev, "%s ISR done\n", __func__);
+		if (isr & UART_MIS_TXMIS) {
+			uart_vdbg(port, "%s: tx\n", __func__);
+			tx_chars(pp);
+		}
+	}
+
+	uart_vdbg(port, "%s: ISR done\n", __func__);
 
   return IRQ_HANDLED;
 }
@@ -836,18 +862,16 @@ static void config_port(struct uart_port *port, int flags)
 #ifdef CONFIG_STELLARIS_DMA
 	struct stellaris_serial_port *pp = container_of(port, struct stellaris_serial_port, port);
 #endif
-	dev_vdbg(port->dev, "%s\n", __func__);
+	uart_vdbg(port, "%s\n", __func__);
 
 	port->type = PORT_STELLARIS;
 
-	if (request_irq(port->irq, interrupt, IRQF_DISABLED, "UART", port))
-		dev_err(port->dev, "Unable to attach UART %d "
-			"interrupt vector=%d\n", port->line, port->irq);
-
 #ifdef CONFIG_STELLARIS_DMA
-	dev_vdbg(port->dev, "%s setup DMA channels\n", __func__);
-	dma_setup_channel(pp->dma_tx_channel, DMA_DEFAULT_CONFIG);
-	dma_setup_channel(pp->dma_rx_channel, DMA_DEFAULT_CONFIG);
+	if (pp->dma_buffer_size) {
+		uart_vdbg(port, "%s: setup DMA channels\n", __func__);
+		dma_setup_channel(pp->dma_tx_channel, DMA_DEFAULT_CONFIG);
+		dma_setup_channel(pp->dma_rx_channel, DMA_DEFAULT_CONFIG);
+	}
 #endif
 }
 
@@ -862,7 +886,7 @@ static const char *get_type(struct uart_port *port)
 
 static int request_port(struct uart_port *port)
 {
-	dev_vdbg(port->dev, "%s\n", __func__);
+	uart_vdbg(port, "%s\n", __func__);
   return 0;
 }
 
@@ -870,14 +894,14 @@ static int request_port(struct uart_port *port)
 
 static void release_port(struct uart_port *port)
 {
-	dev_vdbg(port->dev, "%s\n", __func__);
+	uart_vdbg(port, "%s\n", __func__);
 }
 
 /****************************************************************************/
 
 static int verify_port(struct uart_port *port, struct serial_struct *ser)
 {
-	dev_vdbg(port->dev, "%s\n", __func__);
+	uart_vdbg(port, "%s\n", __func__);
 
   if ((ser->type != PORT_UNKNOWN) && (ser->type != PORT_STELLARIS))
     return -EINVAL;
@@ -912,7 +936,7 @@ static const struct uart_ops ops = {
 
 static struct stellaris_serial_port ports[STLR_NACTIVEUARTS];
 
-static void __init strl_serial_ports_init()
+static void __init strl_serial_ports_init(void)
 {
 	int i;
 	struct stellaris_platform_uart *platp = stellaris_uarts;
@@ -930,20 +954,21 @@ static void __init strl_serial_ports_init()
     pp->uart_index = platp[i].uart_index;
 #ifdef CONFIG_STELLARIS_DMA
 		pp->dma_buffer_size = platp[i].dma_buffer_size;
+		if (pp->dma_buffer_size) {
+			pp->dma_tx_channel = platp[i].dma_tx_channel;
+			pp->dma_tx_buffer  = platp[i].dma_tx_buffer;
+			pp->tx_busy        = 0;
 
-		pp->dma_tx_channel = platp[i].dma_tx_channel;
-		pp->dma_tx_buffer  = platp[i].dma_tx_buffer;
-		pp->tx_busy        = 0;
+			pp->dma_rx_channel = platp[i].dma_rx_channel;
+			pp->rx_slot_a      = platp[i].dma_rx_buffer;
+			pp->rx_slot_b      = (char*)pp->rx_slot_a + RX_SLOT_SIZE(pp);
+			pp->rx_busy        = 0;
 
-		pp->dma_rx_channel = platp[i].dma_rx_channel;
-		pp->rx_slot_a      = platp[i].dma_rx_buffer;
-		pp->rx_slot_b      = (char*)pp->rx_slot_a + RX_SLOT_SIZE(pp);
-		pp->rx_busy        = 0;
+			pp->cur_bytes_received = 0;
 
-		pp->cur_bytes_received = 0;
-
-		pp->rx_timer.function = rx_chars_timeout;
-		pp->rx_timer.data = (unsigned long)pp;
+			pp->rx_timer.function = rx_chars_timeout;
+			pp->rx_timer.data = (unsigned long)pp;
+		}
 #endif
 
 		pp->dtr_gpio = platp[i].dtr_gpio;
@@ -1053,7 +1078,7 @@ static struct uart_driver driver = {
   .dev_name     = "ttyS",
   .major        = TTY_MAJOR,
   .minor        = 64,
-  .nr           = STLR_NUARTS,
+  .nr           = STLR_NACTIVEUARTS,
   .cons         = STELLARIS_CONSOLE,
 };
 
@@ -1070,9 +1095,11 @@ static int __devinit probe(struct platform_device *pdev)
 		port = &pp->port;
 
 #ifdef CONFIG_STELLARIS_DMA
-		tasklet_init(&pp->rx_tasklet, do_rx_chars, (unsigned long)pp);
-		tasklet_disable(&pp->rx_tasklet);
-		init_timer(&pp->rx_timer);
+		if (pp->dma_buffer_size) {
+			tasklet_init(&pp->rx_tasklet, do_rx_chars, (unsigned long)pp);
+			tasklet_disable(&pp->rx_tasklet);
+			init_timer(&pp->rx_timer);
+		}
 #endif
 
 		port->dev = &pdev->dev;
@@ -1090,7 +1117,7 @@ static int __devexit remove(struct platform_device *pdev)
   struct uart_port *port;
   int i;
 
-  for (i = 0; (i < STLR_NUARTS); i++) {
+  for (i = 0; (i < STLR_NACTIVEUARTS); i++) {
     port = &ports[i].port;
     if (port)
       uart_remove_one_port(&driver, port);
