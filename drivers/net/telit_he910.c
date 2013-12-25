@@ -40,17 +40,12 @@ struct telit_modem {
 
 static inline int get_power_status(struct telit_modem *priv)
 {
-	return gpioread(priv->pwr_mon_gpio, 0);
+	return !gpioread(priv->pwr_mon_gpio, 0);
 }
 
 static inline void interface_control(struct telit_modem *priv, int ctrl)
 {
 	gpiowrite(priv->if_en_gpio, ctrl);
-}
-
-static inline int is_modem_ready(struct telit_modem *priv)
-{
-	return !gpioread(priv->spi_srdy_gpio, 0);
 }
 
 #ifdef CONFIG_PROC_FS
@@ -134,8 +129,7 @@ static int modem_on_proc(struct telit_modem *priv)
 {
 	int power_status = 0;
 
-	//interface_control(priv, 1);
-	//power_status = get_power_status(priv);
+	power_status = get_power_status(priv);
 	if (power_status)
 		return power_status;
 
@@ -149,8 +143,7 @@ static int modem_on_proc(struct telit_modem *priv)
 	dev_vdbg(&priv->pdev->dev, "Release PWR_ON\n");
 
 	msleep(200);
-	//interface_control(priv, 1);
-	//power_status = get_power_status(priv);
+	power_status = get_power_status(priv);
 	power_status = 1;
 	dev_dbg(&priv->pdev->dev, "Power: %s\n", power_status ? "ON" : "OFF");
 	
@@ -169,8 +162,6 @@ static int modem_off_proc(struct telit_modem *priv)
 
 	dev_dbg(&priv->pdev->dev, "Switching modem off...\n");
 
-	//interface_control(priv, 0);
-
 	gpiowrite(priv->pwr_on_gpio, 0);
 	dev_vdbg(&priv->pdev->dev, "Hold PWR_ON\n");
 	msleep(3000);
@@ -181,9 +172,7 @@ static int modem_off_proc(struct telit_modem *priv)
 
 	for (i = 0; i < 15; i++ )
 	{
-		//interface_control(priv, 1);
-		//power_status = get_power_status(priv);
-		//interface_control(priv, 0);
+		power_status = get_power_status(priv);
 		power_status = 0;
 		if (!power_status)
 			break;
@@ -193,9 +182,7 @@ static int modem_off_proc(struct telit_modem *priv)
 	if (power_status)
 		hw_shutdown_unconditional(priv);
 	
-	//interface_control(priv, 1);
-	//power_status = get_power_status(priv);
-	//interface_control(priv, 0);
+	power_status = get_power_status(priv);
 
 	if (power_status)
 		dev_err(&priv->pdev->dev, "Fail to power off\n");
@@ -210,7 +197,7 @@ static int power_on(struct telit_modem *priv)
 	const int max_tries = 5;
 	
 	priv->state = switching_on;
-	
+
 	while (1) {
 		power_status = modem_on_proc(priv);
 		if (power_status || tries >= max_tries) break;
@@ -218,12 +205,15 @@ static int power_on(struct telit_modem *priv)
 	}
 
 	priv->state = power_status ? switched_on : switched_off;
+	if (power_status)
+		interface_control(priv, 1);
 	
 	return power_status;
 }
 
 static int power_off(struct telit_modem *priv)
 {
+	interface_control(priv, 0);
 	priv->state = switching_off;
 	modem_off_proc(priv);
 	priv->state = switched_off;
