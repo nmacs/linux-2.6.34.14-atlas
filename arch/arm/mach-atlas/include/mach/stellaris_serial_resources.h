@@ -58,7 +58,12 @@ static struct stellaris_platform_uart stellaris_uarts[] = {
 		.dma_rx_buffer = uart2_dma_rx_buffer,
 		.dma_buffer_size = UART2_DMA_BUFFER_SIZE,
 #endif
-  }
+  },
+	{
+    .mapbase    = STLR_UART6_BASE,
+    .irq        = STLR_UART6_IRQ,
+    .uart_index = 6,
+	}
 };
 
 #define STLR_NACTIVEUARTS ARRAY_SIZE(stellaris_uarts)
