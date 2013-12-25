@@ -29,6 +29,11 @@
 #define STLR_UART0_IRQ    5
 #define STLR_UART1_IRQ    6
 #define STLR_UART2_IRQ    33
+#define STLR_UART3_IRQ    56
+#define STLR_UART4_IRQ    57
+#define STLR_UART5_IRQ    58
+#define STLR_UART6_IRQ    59
+#define STLR_UART7_IRQ    60
 
 #define STLR_TIMER0_IRQ   19
 #define STLR_TIMER1_IRQ   21
