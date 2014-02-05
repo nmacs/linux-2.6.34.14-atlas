@@ -1,5 +1,5 @@
-#define DEBUG
-#define VERBOSE_DEBUG 1
+//#define DEBUG
+//#define VERBOSE_DEBUG 1
 
 #include <linux/module.h>
 #include <linux/kernel.h>
