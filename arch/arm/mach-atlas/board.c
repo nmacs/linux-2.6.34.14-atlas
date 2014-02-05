@@ -129,7 +129,7 @@ static struct spi_eeprom eeprom_chip = {
 static struct spi_board_info spi_devices[] = {
   {
     .modalias      = "w25q64",
-    .max_speed_hz  = 10 * 1000000,
+    .max_speed_hz  = 80 * 1000000,
     .bus_num       = 0,
     .chip_select   = 0,
     .platform_data = &flash_chip,
