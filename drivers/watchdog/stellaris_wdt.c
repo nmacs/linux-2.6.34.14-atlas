@@ -14,6 +14,7 @@
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/interrupt.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -43,6 +44,8 @@ MODULE_PARM_DESC(wdt_time, "Watchdog time in seconds. (default="
 
 static unsigned long stellaris_wdt_busy;
 static spinlock_t stellaris_lock;
+static struct device *dev;
+static unsigned int irq;
 
 /* ......................................................................... */
 
@@ -73,6 +76,7 @@ static inline void stellaris_wdt_reload(void)
 {
 	spin_lock(&stellaris_lock);
 	putregwdt32(1, STLR_WATCHDOG_WDTICR(CURRENT_WDT));
+	enable_irq(irq);
 	spin_unlock(&stellaris_lock);
 }
 
@@ -208,6 +212,13 @@ static ssize_t stellaris_wdt_write(struct file *file, const char *data,
 	return len;
 }
 
+static irqreturn_t watchdog_armed(unsigned int irq, void *pw)
+{
+	dev_emerg(dev, "Watchdog armed!\n");
+	disable_irq_nosync(irq);
+	return IRQ_HANDLED;
+}
+
 /* ......................................................................... */
 
 static const struct file_operations stellaris_wdt_fops = {
@@ -228,14 +239,26 @@ static struct miscdevice stellaris_wdt_miscdev = {
 static int __devinit stellaris_wdt_probe(struct platform_device *pdev)
 {
 	int res;
+	
+	if (pdev->num_resources < 1 || pdev->resource[0].flags != IORESOURCE_IRQ)
+		return -EINVAL;
+	irq = pdev->resource[0].start;
 
 	if (stellaris_wdt_miscdev.parent)
 		return -EBUSY;
-	stellaris_wdt_miscdev.parent = &pdev->dev;
+	stellaris_wdt_miscdev.parent = dev = &pdev->dev;
+	
+	res = request_irq(irq, watchdog_armed, IRQF_TRIGGER_HIGH, pdev->name, dev);
+	if (res < 0) {
+		dev_err(&pdev->dev, "Failed to get irq\n");
+		return res;
+	}
 
 	res = misc_register(&stellaris_wdt_miscdev);
-	if (res)
+	if (res) {
+		free_irq(irq, dev);
 		return res;
+	}
 
 	printk(KERN_INFO "Stellaris Watchdog Timer enabled (%d seconds), nowayout\n", wdt_time);
 	return 0;
@@ -243,13 +266,10 @@ static int __devinit stellaris_wdt_probe(struct platform_device *pdev)
 
 static int __devexit stellaris_wdt_remove(struct platform_device *pdev)
 {
-	int res;
-
-	res = misc_deregister(&stellaris_wdt_miscdev);
-	if (!res)
-		stellaris_wdt_miscdev.parent = NULL;
-
-	return res;
+	misc_deregister(&stellaris_wdt_miscdev);
+	stellaris_wdt_miscdev.parent = NULL;
+	free_irq(irq, dev);
+	return 0;
 }
 
 static void stellaris_wdt_shutdown(struct platform_device *pdev)

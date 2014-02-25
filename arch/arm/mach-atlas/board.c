@@ -159,10 +159,19 @@ static struct platform_device uart_device = {
 
 /***************************************************************************/
 
+static struct resource wdt_resources[] = {
+  {
+         .start = STLR_WATCHDOR_IRQ,
+         .end = STLR_WATCHDOR_IRQ,
+         .flags = IORESOURCE_IRQ,
+  },
+};
+
 static struct platform_device wdt_device = {
 	.name		= "stellaris-wdt",
 	.id		= -1,
-	.num_resources	= 0,
+	.num_resources	= 1,
+	.resource = wdt_resources,
 };
 
 /***************************************************************************/

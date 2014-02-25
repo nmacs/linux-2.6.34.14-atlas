@@ -35,6 +35,8 @@
 #define STLR_UART6_IRQ    59
 #define STLR_UART7_IRQ    60
 
+#define STLR_WATCHDOR_IRQ 18
+
 #define STLR_TIMER0_IRQ   19
 #define STLR_TIMER1_IRQ   21
 
