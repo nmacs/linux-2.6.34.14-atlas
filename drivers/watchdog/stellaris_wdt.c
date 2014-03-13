@@ -212,7 +212,7 @@ static ssize_t stellaris_wdt_write(struct file *file, const char *data,
 	return len;
 }
 
-static irqreturn_t watchdog_armed(unsigned int irq, void *pw)
+static irqreturn_t watchdog_armed(int irq, void *pw)
 {
 	dev_emerg(dev, "Watchdog armed!\n");
 	disable_irq_nosync(irq);
