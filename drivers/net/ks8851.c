@@ -127,7 +127,8 @@ struct ks8851_net {
 	struct work_struct	tx_work;
 	struct work_struct	irq_work;
 	struct work_struct	rxctrl_work;
-	struct delayed_work	wdt_work;
+	struct work_struct	reset_work;
+	unsigned long trans_start;
 
 	struct sk_buff_head	txq;
 
@@ -550,11 +551,10 @@ static void ks8851_rx_pkts(struct ks8851_net *ks)
 
 	netif_dbg(ks, rx_status, ks->netdev,
 		  "%s: %d packets\n", __func__, rxfc);
-	
+
 	if (rxfc == 0) {
-		mdelay(1);
-		/* RX interrupt but no data in buffer. Which means hardware failure condition. Reset. */
-		ks8851_reset(ks);
+		/* RX interrupt occured but there is no data in buffer. Which means hardware failure condition. Reset. */
+		schedule_work(&ks->reset_work);
 	}
 
 	/* Currently we're issuing a read per packet, but we could possibly
@@ -665,10 +665,6 @@ static void ks8851_irq_work(struct work_struct *work)
 
 	if (status & IRQ_TXI) {
 		handled |= IRQ_TXI;
-		
-		mutex_unlock(&ks->lock);
-		cancel_delayed_work_sync(&ks->wdt_work);
-		mutex_lock(&ks->lock);
 
 		/* no lock here, tx queue should have been stopped */
 
@@ -722,8 +718,10 @@ static void ks8851_irq_work(struct work_struct *work)
 	if (status & IRQ_LCI)
 		mii_check_link(&ks->mii);
 
-	if (status & IRQ_TXI)
+	if (status & IRQ_TXI) {
+		ks->trans_start = 0;
 		netif_wake_queue(ks->netdev);
+	}
 
 	enable_irq(ks->netdev->irq);
 }
@@ -801,17 +799,6 @@ static void ks8851_done_tx(struct ks8851_net *ks, struct sk_buff *txb)
 	dev_kfree_skb(txb);
 }
 
-static void ks8851_wdt_work(struct delayed_work *work)
-{
-	struct ks8851_net *ks = container_of(work, struct ks8851_net, wdt_work);
-	mutex_lock(&ks->lock);
-
-	mdelay(1);
-	ks8851_reset(ks);
-
-	mutex_unlock(&ks->lock);
-}
-
 /**
  * ks8851_tx_work - process tx packet(s)
  * @work: The work strucutre what was scheduled.
@@ -840,8 +827,6 @@ static void ks8851_tx_work(struct work_struct *work)
 			ks8851_done_tx(ks, txb);
 		}
 	}
-
-	schedule_delayed_work(&ks->wdt_work, msecs_to_jiffies(KS8851_TX_TIMEOUT_MS));
 
 	mutex_unlock(&ks->lock);
 }
@@ -902,6 +887,8 @@ static int ks8851_net_open(struct net_device *dev)
 
 	ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr);
 
+	ks->trans_start = 0;
+
 	/* clear then enable interrupts */
 
 #define STD_IRQ (IRQ_LCI |	/* Link Change */	\
@@ -920,6 +907,58 @@ static int ks8851_net_open(struct net_device *dev)
 	netif_dbg(ks, ifup, ks->netdev, "network device up\n");
 
 	mutex_unlock(&ks->lock);
+	return 0;
+}
+
+/**
+ * ks8851_net_stop - close network device
+ * @dev: The device being closed.
+ *
+ * Called to close down a network device which has been active. Cancell any
+ * work, shutdown the RX and TX process and then place the chip into a low
+ * power state whilst it is not being used.
+ */
+static int ks8851_net_stop(struct net_device *dev)
+{
+	struct ks8851_net *ks = netdev_priv(dev);
+
+	netif_info(ks, ifdown, dev, "shutting down\n");
+
+	netif_stop_queue(dev);
+
+	mutex_lock(&ks->lock);
+	/* turn off the IRQs and ack any outstanding */
+	ks8851_wrreg16(ks, KS_IER, 0x0000);
+	ks8851_wrreg16(ks, KS_ISR, 0xffff);
+	mutex_unlock(&ks->lock);
+
+	/* stop any outstanding work */
+	flush_work(&ks->irq_work);
+	flush_work(&ks->tx_work);
+	flush_work(&ks->rxctrl_work);
+	flush_work(&ks->reset_work);
+
+	mutex_lock(&ks->lock);
+	/* shutdown RX process */
+	ks8851_wrreg16(ks, KS_RXCR1, 0x0000);
+
+	/* shutdown TX process */
+	ks8851_wrreg16(ks, KS_TXCR, 0x0000);
+
+	/* set powermode to soft power down to save power */
+	ks8851_set_powermode(ks, PMECR_PM_SOFTDOWN);
+	mutex_unlock(&ks->lock);
+
+	/* ensure any queued tx buffers are dumped */
+	while (!skb_queue_empty(&ks->txq)) {
+		struct sk_buff *txb = skb_dequeue(&ks->txq);
+
+		netif_dbg(ks, ifdown, ks->netdev,
+			  "%s: freeing txb %p\n", __func__, txb);
+
+		dev_kfree_skb(txb);
+	}
+
 	return 0;
 }
 
@@ -951,62 +990,21 @@ static void ks8851_reset(struct ks8851_net *ks)
 		dev_kfree_skb(txb);
 	}
 
-	/* reopen device */
-	ks8851_net_open(ks->netdev);
+	ks8851_net_open(ks->netdev); /* reopen device */
 
 	mutex_lock(&ks->lock);
 }
 
-/**
- * ks8851_net_stop - close network device
- * @dev: The device being closed.
- *
- * Called to close down a network device which has been active. Cancell any
- * work, shutdown the RX and TX process and then place the chip into a low
- * power state whilst it is not being used.
- */
-static int ks8851_net_stop(struct net_device *dev)
+static void ks8851_reset_work(struct work_struct *work)
 {
-	struct ks8851_net *ks = netdev_priv(dev);
+	struct ks8851_net *ks = container_of(work, struct ks8851_net, reset_work);
 
-	netif_info(ks, ifdown, dev, "shutting down\n");
-
-	netif_stop_queue(dev);
-
+	mdelay(1); /* small delay required by device */
 	mutex_lock(&ks->lock);
-	/* turn off the IRQs and ack any outstanding */
-	ks8851_wrreg16(ks, KS_IER, 0x0000);
-	ks8851_wrreg16(ks, KS_ISR, 0xffff);
+
+	ks8851_reset(ks);
+
 	mutex_unlock(&ks->lock);
-
-	/* stop any outstanding work */
-	flush_work(&ks->irq_work);
-	flush_work(&ks->tx_work);
-	flush_work(&ks->rxctrl_work);
-	cancel_delayed_work_sync(&ks->wdt_work);
-
-	mutex_lock(&ks->lock);
-	/* shutdown RX process */
-	ks8851_wrreg16(ks, KS_RXCR1, 0x0000);
-
-	/* shutdown TX process */
-	ks8851_wrreg16(ks, KS_TXCR, 0x0000);
-
-	/* set powermode to soft power down to save power */
-	ks8851_set_powermode(ks, PMECR_PM_SOFTDOWN);
-	mutex_unlock(&ks->lock);
-
-	/* ensure any queued tx buffers are dumped */
-	while (!skb_queue_empty(&ks->txq)) {
-		struct sk_buff *txb = skb_dequeue(&ks->txq);
-
-		netif_dbg(ks, ifdown, ks->netdev,
-			  "%s: freeing txb %p\n", __func__, txb);
-
-		dev_kfree_skb(txb);
-	}
-
-	return 0;
 }
 
 /**
@@ -1034,11 +1032,14 @@ static netdev_tx_t ks8851_start_xmit(struct sk_buff *skb,
 
 	spin_lock(&ks->statelock);
 
-	if (needed > ks->tx_space) {
+	if (needed > ks->tx_space || ks->trans_start && time_after(jiffies, (ks->trans_start + HZ/5))) {
 		netif_stop_queue(dev);
 		ret = NETDEV_TX_BUSY;
 	} else {
 		ks->tx_space -= needed;
+		dev->trans_start = jiffies;
+		if (ks->trans_start == 0)
+			ks->trans_start = jiffies;
 		skb_queue_tail(&ks->txq, skb);
 	}
 
@@ -1129,6 +1130,14 @@ static void ks8851_set_rx_mode(struct net_device *dev)
 	spin_unlock(&ks->statelock);
 }
 
+static void ks8851_tx_timeout(struct net_device *dev)
+{
+	struct ks8851_net *ks = netdev_priv(dev);
+
+	dev->stats.tx_errors++;
+	schedule_work(&ks->reset_work);
+}
+
 static int ks8851_set_mac_address(struct net_device *dev, void *addr)
 {
 	struct sockaddr *sa = addr;
@@ -1163,6 +1172,7 @@ static const struct net_device_ops ks8851_netdev_ops = {
 	.ndo_set_rx_mode	= ks8851_set_rx_mode,
 	.ndo_change_mtu		= eth_change_mtu,
 	.ndo_validate_addr	= eth_validate_addr,
+	.ndo_tx_timeout		= ks8851_tx_timeout,
 };
 
 /* ethtool support */
@@ -1380,6 +1390,7 @@ static int __devinit ks8851_probe(struct spi_device *spi)
 	ks->netdev = ndev;
 	ks->spidev = spi;
 	ks->tx_space = KS8851_TX_QUEUE_SIZE;
+	ks->trans_start = 0;
 
 	mutex_init(&ks->lock);
 	spin_lock_init(&ks->statelock);
@@ -1387,7 +1398,7 @@ static int __devinit ks8851_probe(struct spi_device *spi)
 	INIT_WORK(&ks->tx_work, ks8851_tx_work);
 	INIT_WORK(&ks->irq_work, ks8851_irq_work);
 	INIT_WORK(&ks->rxctrl_work, ks8851_rxctrl_work);
-	INIT_DELAYED_WORK(&ks->wdt_work, ks8851_wdt_work);
+	INIT_WORK(&ks->reset_work, ks8851_reset_work);
 
 	/* initialise pre-made spi transfer messages */
 
@@ -1416,6 +1427,7 @@ static int __devinit ks8851_probe(struct spi_device *spi)
 	skb_queue_head_init(&ks->txq);
 
 	SET_ETHTOOL_OPS(ndev, &ks8851_ethtool_ops);
+	ndev->watchdog_timeo = HZ;
 	SET_NETDEV_DEV(ndev, &spi->dev);
 
 	dev_set_drvdata(&spi->dev, ks);
