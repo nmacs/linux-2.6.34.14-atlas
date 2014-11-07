@@ -26,6 +26,10 @@
 #include <mach/cpu.h>
 #include <net/telit_he910.h>
 
+#ifdef CONFIG_OMEGA_RF
+#include <net/omega_rf.h>
+#endif
+
 /***************************************************************************/
 
 static struct resource board_spi_resources0[] = {
@@ -52,7 +56,11 @@ static struct resource board_spi_resources1[] = {
   },
 };
 
+#ifndef CONFIG_OMEGA_RF
 static int board_spi0_cs[] = {GPIO_SSI_CS_SF, GPIO_SSI_CS_EE};
+#else
+static int board_spi0_cs[] = {GPIO_SSI_CS_SF, GPIO_SSI_CS_RF};
+#endif
 
 #ifdef CONFIG_STELLARIS_DMA
 char __sramdata ssi0_dma_rx_buffer[DMA_MAX_TRANSFER_SIZE];
@@ -126,6 +134,14 @@ static struct spi_eeprom eeprom_chip = {
   .flags    = EE_ADDR2,
 };
 
+#ifdef CONFIG_OMEGA_RF
+struct omega_rf_platform_data omega_rf_chip = {
+	.nrdy_gpio = GPIO_RF_NRDY,
+	.nirq_gpio = GPIO_RF_INTRN,
+	.nrst_gpio = GPIO_RF_NRST,
+};
+#endif
+
 static struct spi_board_info spi_devices[] = {
   {
     .modalias      = "w25q64",
@@ -134,6 +150,7 @@ static struct spi_board_info spi_devices[] = {
     .chip_select   = 0,
     .platform_data = &flash_chip,
   },
+#ifndef CONFIG_OMEGA_RF
   {
     .modalias      = "at25",
     .max_speed_hz  = 5 * 1000000,
@@ -141,6 +158,16 @@ static struct spi_board_info spi_devices[] = {
     .chip_select   = 1,
     .platform_data = &eeprom_chip,
   },
+#else
+  {
+    .modalias      = "omega_rf",
+    .max_speed_hz  = 1 * 1000000,
+    .bus_num       = 0,
+    .chip_select   = 1,
+    .irq           = STLR_GPIOE_IRQ, // RF IRQ on PE6
+    .platform_data = &omega_rf_chip,
+  },
+#endif
   {
     .modalias      = "ks8851",
     .max_speed_hz  = 5 * 1000000,
@@ -264,6 +291,7 @@ static void __init board_init(void)
 	spi_register_board_info(spi_devices, ARRAY_SIZE(spi_devices));
 
 	gpioirqenable(GPIO_ETH_INTRN);
+	gpioirqenable(GPIO_RF_INTRN);
 }
 
 /***************************************************************************/

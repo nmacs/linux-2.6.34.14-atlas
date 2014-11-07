@@ -1,0 +1,6 @@
+config OMEGA_RF
+	bool "OmegaRF radio modem support"
+	depends on EXPERIMENTAL
+	---help---
+	  This is an experimental driver for the OmegaRF radio modem.
+
