@@ -223,7 +223,7 @@ SECTIONS
 #endif
 
 	/* The initial task and kernel stack */
-	.data.init_task : AT(ADDR(.data.init_task) - LOAD_OFFSET) {
+	.data..init_task : AT(ADDR(.data..init_task) - LOAD_OFFSET) {
 		INIT_TASK_DATA(THREAD_SIZE)
 	}
 
