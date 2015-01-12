@@ -28,6 +28,8 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 
+#include <linux/delay.h>
+
 /* Fork a new task - this creates a new program thread.
  * This is called indirectly via a small wrapper
  */
@@ -48,12 +50,12 @@ asmlinkage int sys_clone(unsigned long clone_flags, unsigned long newsp,
 			 int __user *parent_tidptr, int tls_val,
 			 int __user *child_tidptr, struct pt_regs *regs)
 {
-	if (!newsp)
+	if (!newsp) {
 		newsp = regs->ARM_sp;
-
 #ifdef CONFIG_CPU_V7M
-	newsp -= 32;
+		newsp -= 32;
 #endif
+	}
 
 	return do_fork(clone_flags, newsp, regs, 0, parent_tidptr, child_tidptr);
 }
